@@ -7,20 +7,20 @@ from pathlib import Path
 import re
 import tempfile
 from urllib.parse import urlsplit
-from .config_crypto import KEY_ENV, EncryptionError, decode_string, encode_string, generate_key, validate_key
+from .config_export import ExportError, decode_config_document, encode_config_document, read_open_text
+from .effort import normalize_effort
 from .paths import artifacts_dir
 
 class ConfigError(RuntimeError):
     pass
-_ENCRYPTED_FORMAT = 'LRAEP-config-fernet-v1'
 _TOP_LEVEL = {'version', 'mode', 'official_source', 'device', 'training', 'pool', 'node', 'vpn'}
-_TRAINING_DEFAULTS = {'m': 256, 'n': 256, 'k': 2048, 'tile_h': 8, 'tile_w': 8, 'max_batches': 0, 'max_seconds': 0, 'output_dir': str(artifacts_dir())}
+_TRAINING_DEFAULTS = {'m': 256, 'n': 256, 'k': 2048, 'tile_h': 8, 'tile_w': 8, 'max_batches': 0, 'max_seconds': 0, 'main_effort': [[60, 80], [120, 70], [180, 10]], 'decoy_effort': [], 'output_dir': str(artifacts_dir())}
 _POOL_DEFAULTS = {'host': '', 'port': 7048, 'tls': False, 'ca_file': None, 'WR_wallet': '', 'KEX_uname': '', 'worker': 'rig-01', 'password': 'x', 'connect_timeout': 15, 'read_timeout': 60, 'reconnect_delay': 3, 'protocol': 'WR', 'compression': 'none', 'certificate_version': None, 'agent': 'LRAEP-trainer/0.1', 'stop_on_unknown_request': True, 'unknown_request_dir': None, 'protocol_documentation': None}
 _POOL_PROFILES = ('KEX', 'WR')
 _POOL_CONNECTION_FIELDS = {'host', 'port', 'tls', 'ca_file', 'compression', 'certificate_version', 'protocol_documentation'}
 _NODE_DEFAULTS = {'rpc_url': 'https://127.0.0.1:44107', 'username': '', 'password': '', 'ca_file': None, 'poll_interval': 2, 'refresh_interval': 15, 'rpc_timeout': 15, 'address': ''}
 _VPN_DEFAULTS = {'enabled': True, 'link': '', 'core_path': None, 'startup_timeout': 10, 'links_file': 'links.txt', 'check_url': 'https://api.ipify.org'}
-DEFAULT_CONFIG = {'version': 1, 'mode': 'pool', 'official_source': 'src/LRAEP_helpers', 'device': 'cuda:0', 'training': dict(_TRAINING_DEFAULTS), 'pool': dict(_POOL_DEFAULTS), 'node': dict(_NODE_DEFAULTS), 'vpn': dict(_VPN_DEFAULTS)}
+DEFAULT_CONFIG = {'version': 1, 'mode': 'pool', 'official_source': 'src/LRAEP_helpers', 'device': 'cuda:0', 'training': copy.deepcopy(_TRAINING_DEFAULTS), 'pool': dict(_POOL_DEFAULTS), 'node': dict(_NODE_DEFAULTS), 'vpn': dict(_VPN_DEFAULTS)}
 
 def _object_without_duplicates(pairs):
     result = {}
@@ -168,30 +168,13 @@ def _config_path(path) -> Path:
     except (OSError, RuntimeError, ValueError):
         raise ConfigError('configuration path is not a valid filesystem path') from None
 
-def _encryption_key(config_path, key=None, *, create=False):
+def _open_text(config_path, key=None):
+    if key is not None:
+        return key
     try:
-        if key is not None:
-            return validate_key(key)
-        key_path = config_path.with_name('config.key')
-        try:
-            return validate_key(key_path.read_text(encoding='ascii').strip())
-        except FileNotFoundError:
-            if not create:
-                raise ConfigError('config.key is required') from None
-        new_key = generate_key()
-        try:
-            descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 384)
-        except FileExistsError:
-            return validate_key(key_path.read_text(encoding='ascii').strip())
-        with os.fdopen(descriptor, 'w', encoding='ascii') as stream:
-            stream.write(new_key + '\n')
-            stream.flush()
-            os.fsync(stream.fileno())
-        return new_key
-    except EncryptionError as exc:
-        raise ConfigError(str(exc)) from None
-    except (OSError, UnicodeError):
-        raise ConfigError('could not read or create the configuration encryption key') from None
+        return read_open_text(config_path.parent / '.env')
+    except (ExportError, OSError, UnicodeError):
+        raise ConfigError('could not read open_text from the adjacent .env file') from None
 
 def _parse_json(raw):
     try:
@@ -205,10 +188,11 @@ def read_config(path, *, key=None) -> dict:
         raw = config_path.read_text(encoding='utf-8')
     except (OSError, UnicodeError):
         raise ConfigError('could not read the configuration file') from None
+    document = _parse_json(raw)
     try:
-        config = _parse_json(decode_string(raw.strip(), _encryption_key(config_path, key)))
-    except EncryptionError as exc:
-        raise ConfigError(str(exc)) from None
+        config = decode_config_document(document, _open_text(config_path, key))
+    except ExportError:
+        raise ConfigError('could not decode the encoded configuration with open_text') from None
     _validate_config(config, config_path)
     return config
 
@@ -219,7 +203,7 @@ def load_config(path, *, key=None) -> dict:
 def _atomic_write(config_path, payload: str):
     temporary = None
     try:
-        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=config_path.parent, prefix='.config-', delete=False) as stream:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=config_path.parent, prefix='.config.json-', delete=False) as stream:
             temporary = Path(stream.name)
             os.fchmod(stream.fileno(), 384)
             stream.write(payload)
@@ -236,15 +220,11 @@ def save_config(path, values: dict, *, key=None) -> None:
     config_path = _config_path(path)
     _validate_config(values, config_path)
     try:
-        plaintext = json.dumps(values, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
-    except (TypeError, ValueError, RecursionError):
-        raise ConfigError('configuration must contain JSON-compatible values') from None
-    resolved_key = _encryption_key(config_path, key, create=True)
-    try:
-        ciphertext = encode_string(plaintext, resolved_key)
-    except EncryptionError as exc:
-        raise ConfigError(str(exc)) from None
-    _atomic_write(config_path, ciphertext + '\n')
+        document = encode_config_document(values, _open_text(config_path, key))
+        payload = json.dumps(document, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
+    except (ExportError, TypeError, ValueError, RecursionError):
+        raise ConfigError('could not encode the configuration with open_text') from None
+    _atomic_write(config_path, payload + '\n')
 
 def update_config(path, changes: dict, *, key=None) -> None:
     if not isinstance(changes, dict):
@@ -260,9 +240,6 @@ def update_config(path, changes: dict, *, key=None) -> None:
     merge(config, changes)
     save_config(path, config, key=key)
 
-def encrypt_config_file(path, *, key=None) -> None:
-    save_config(path, read_config(path, key=key), key=key)
-
 def _validate_config(config, config_path) -> dict:
     config = _section(config, _TOP_LEVEL, 'configuration')
     if 'version' not in config or type(config['version']) is not int or config['version'] != 1:
@@ -275,8 +252,21 @@ def _validate_config(config, config_path) -> dict:
         raise ConfigError('device must select CUDA, for example cuda:0')
     directory = config_path.parent
     official_source = _path(config.get('official_source', 'src/LRAEP_helpers'), 'official_source', directory)
-    training = dict(_TRAINING_DEFAULTS)
-    training.update(_section(config.get('training', {}), set(training), 'training'))
+    raw_training = _section(config.get('training', {}),
+                            set(_TRAINING_DEFAULTS) | {'max_gpu_utilization'}, 'training')
+    training = copy.deepcopy(_TRAINING_DEFAULTS)
+    training.update({field: value for field, value in raw_training.items()
+                     if field != 'max_gpu_utilization'})
+    if 'max_gpu_utilization' in raw_training:
+        legacy = _integer(raw_training['max_gpu_utilization'], 'training.max_gpu_utilization', 1, 100)
+        if 'main_effort' not in raw_training:
+            training['main_effort'] = [[60, legacy]]
+    for field in ('main_effort', 'decoy_effort'):
+        try:
+            training[field] = normalize_effort(training[field], field=f'training.{field}',
+                                               allow_empty=field == 'decoy_effort')
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from None
     for field in ('m', 'n'):
         _integer(training[field], f'training.{field}', 128, 4096)
     _integer(training['k'], 'training.k', 2048, 65536)

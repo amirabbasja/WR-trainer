@@ -8,6 +8,8 @@ import time
 import numpy as np
 import torch
 from .gpu import TrainingCancelled
+from .gpu_pacing import GpuPacer
+from .effort import EffortSchedule
 from .progress import LiveProgress
 from .protocol import TrainingConfig, load_official_helpers, pool_share_target, prepare_batch, search_batch, verified_pool_share
 from .telemetry import GpuUtilization
@@ -100,6 +102,19 @@ def _signal_stop(stopped, time_limit=0):
             signal.signal(sig, handler)
 
 def run_pool_training(configuration: dict, *, login_only: bool=False) -> int:
+    settings = configuration['training']
+    stopped = threading.Event()
+    started = time.monotonic()
+    effort = None if login_only else EffortSchedule(settings['main_effort'], started=started)
+    deadline = started + settings['max_seconds'] if settings['max_seconds'] else None
+    with _signal_stop(stopped, settings['max_seconds']), ExitStack() as resources:
+        if effort is not None:
+            resources.enter_context(effort.stopping(stopped))
+            if not effort.wait(stopped, deadline=deadline):
+                return 0
+        return _run_pool_training(configuration, login_only=login_only, stopped=stopped, effort=effort, started=started)
+
+def _run_pool_training(configuration, *, login_only, stopped, effort, started):
     from .config import resolve_pool_settings
     from .pool_client import PoolAuthenticationError, PoolCompatibilityError, PoolSession, StalePoolJob
     from .pool_transport import PoolConnectionError
@@ -134,19 +149,19 @@ def run_pool_training(configuration: dict, *, login_only: bool=False) -> int:
     if not login_only:
         LOG.info('Mining backend: %s', 'native CUDA DP4A' if use_native else 'PyTorch reference')
     torch.set_num_threads(min(4, torch.get_num_threads()))
-    stopped = threading.Event()
     stats = PoolTrainingStats()
     rng = np.random.default_rng()
-    started = time.monotonic()
     limit = settings['max_seconds']
     max_batches = settings['max_batches']
+    pacer = GpuPacer(device, 100) if not login_only else None
+    deadline = started + limit if limit else None
 
     def expired():
-        return stopped.is_set() or (limit > 0 and time.monotonic() - started >= limit)
+        return stopped.is_set() or (limit > 0 and time.monotonic() - started >= limit) or (effort is not None and effort.ended())
 
     def finished():
         return expired() or (max_batches > 0 and stats.batches >= max_batches)
-    with _signal_stop(stopped, limit), ExitStack() as resources:
+    with ExitStack() as resources:
         progress = resources.enter_context(LiveProgress())
         monitor = None
         if not login_only:
@@ -167,11 +182,16 @@ def run_pool_training(configuration: dict, *, login_only: bool=False) -> int:
             log(logging.INFO, 'PearlHash GPU report sent: %s (request=%d)', format_hashrate(rate), request_id)
         update_progress(force=True)
         while not finished():
+            if effort is not None and (not effort.wait(stopped, deadline=deadline)):
+                break
             session = None
             try:
                 session_settings = dict(pool)
-                if limit > 0:
-                    remaining = max(0.001, limit - (time.monotonic() - started))
+                connect_deadline = deadline
+                if effort is not None and effort.exit_deadline is not None:
+                    connect_deadline = effort.exit_deadline if connect_deadline is None else min(connect_deadline, effort.exit_deadline)
+                if connect_deadline is not None:
+                    remaining = max(0.001, connect_deadline - time.monotonic())
                     session_settings['connect_timeout'] = min(pool['connect_timeout'], remaining)
                 session = session_class(session_settings, stop_event=stopped, **session_options)
                 with session:
@@ -184,6 +204,12 @@ def run_pool_training(configuration: dict, *, login_only: bool=False) -> int:
                     previous_generation = None
                     job_deadline = time.monotonic() + pool['read_timeout']
                     while not finished():
+                        if effort is not None:
+                            paused = effort.current()[0] == 0
+                            if not effort.wait(stopped, deadline=deadline):
+                                break
+                            if paused:
+                                job_deadline = time.monotonic() + pool['read_timeout']
                         update_progress()
                         snapshot = session.wait_job(timeout=0.25)
                         if snapshot is None:
@@ -203,17 +229,30 @@ def run_pool_training(configuration: dict, *, login_only: bool=False) -> int:
                         if login_only:
                             log(logging.INFO, 'Authenticated job verified: header=%d bytes, target=%d bits; no GPU work or shares submitted', len(job.header_bytes), target.bit_length())
                             return 0
+                        utilization, boundary = effort.current()
+                        if utilization <= 0 or expired():
+                            continue
+                        if pacer.max_utilization != utilization:
+                            pacer.set_utilization(utilization)
+                            log(logging.INFO, 'Main effort GPU duty-cycle target: %d%%', utilization)
+                        rest_deadline = min(boundary, deadline) if deadline is not None else boundary
+                        cancelled = lambda: expired() or time.monotonic() >= boundary or (not session.is_current(snapshot))
+                        pacer.begin()
                         if selected_protocol == 'WR':
                             batch = prepare_wr_batch(job, cfg, rng, device=configuration['device'], native=use_native)
                         else:
                             batch = prepare_batch(header, job.cert_version, cfg, rng, device=configuration['device'], gpu_signals=True, native=use_native)
-                        if expired() or not session.is_current(snapshot):
+                        if cancelled():
+                            pacer.finish(cancelled=True)
+                            pacer.wait(stopped, deadline=rest_deadline)
                             continue
-                        cancelled = lambda: expired() or not session.is_current(snapshot)
                         try:
                             matches = search_batch(batch, target, configuration['device'], cancelled)
                         except TrainingCancelled:
+                            pacer.finish(cancelled=True)
+                            pacer.wait(stopped, deadline=rest_deadline)
                             continue
+                        pacer.finish()
                         stats.batches += 1
                         stats.attempts += cfg.m // cfg.tile_h * (cfg.n // cfg.tile_w)
                         if selected_protocol == 'WR':
@@ -224,7 +263,7 @@ def run_pool_training(configuration: dict, *, login_only: bool=False) -> int:
                                 report_started = now
                                 reported_work = True
                         for row, col, digest in matches:
-                            if expired() or not session.is_current(snapshot):
+                            if cancelled():
                                 stats.stale += 1
                                 break
                             if selected_protocol == 'WR':
@@ -232,7 +271,7 @@ def run_pool_training(configuration: dict, *, login_only: bool=False) -> int:
                             else:
                                 proof, _ = verified_pool_share(batch, header, job.cert_version, row, col, digest, target)
                                 submission = proof.to_base64()
-                            if expired() or not session.is_current(snapshot):
+                            if cancelled():
                                 stats.stale += 1
                                 break
                             try:
@@ -248,6 +287,8 @@ def run_pool_training(configuration: dict, *, login_only: bool=False) -> int:
                                 stats.rejected += 1
                                 log(logging.WARNING, 'Pool rejected training share job=%s: %s', job.job_id, result.error)
                         update_progress()
+                        if not finished():
+                            pacer.wait(stopped, deadline=rest_deadline)
                     if selected_protocol == 'WR':
                         session.raise_if_failed()
             except (PoolAuthenticationError, PoolCompatibilityError):

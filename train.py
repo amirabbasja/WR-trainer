@@ -14,9 +14,10 @@ def run(root=None, *, login_only=False):
         from LRAEP_trainer.config import load_config, resolve_pool_settings
         from LRAEP_trainer.network import routed
         from LRAEP_trainer.pool_training import run_pool_training, validate_pool_endpoint, validate_pool_identity
-        from LRAEP_trainer.protocol import load_official_helpers
         from LRAEP_trainer.vpn import ManagedVPN
-        config = load_config(root / '.config')
+        config = load_config(root / 'config.json')
+        if not login_only and config['training']['main_effort'][0][1] == -1:
+            return 0
         config['pool'] = resolve_pool_settings(config['pool'])
         if config['pool']['protocol'] != 'WR':
             raise ValueError('WR is required')
@@ -24,11 +25,6 @@ def run(root=None, *, login_only=False):
             raise ValueError('An enabled VPN link is required')
         validate_pool_endpoint(config['pool'])
         validate_pool_identity(config['pool'], validate_address=False)
-        load_official_helpers(config['official_source'])
-        if not login_only:
-            import torch
-            if torch.device(config['device']).type != 'cuda' or not torch.cuda.is_available():
-                raise ValueError('CUDA is required')
         with ManagedVPN(config['vpn']) as proxy, routed(proxy):
             print('WR training | VPN enabled', flush=True)
             return run_pool_training(config, login_only=login_only)

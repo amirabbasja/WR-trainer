@@ -4,7 +4,7 @@ import platform
 DEFAULT_SOURCE = Path(__file__).resolve().parents[1] / 'LRAEP_helpers'
 
 def default_config_path() -> Path:
-    return Path(__file__).resolve().parents[2] / '.config'
+    return Path(__file__).resolve().parents[2] / 'config.json'
 
 def bundled_xray() -> Path | None:
     if platform.system() != 'Linux':
