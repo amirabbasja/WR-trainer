@@ -1,10 +1,134 @@
+import atexit
 import logging
 import os
+import signal
+import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 
+_process = None
+_output_thread = None
+_last_returncode = None
+_process_lock = threading.RLock()
+
+
+def _signal_worker(process, *, force=False):
+    try:
+        if os.name == 'posix':
+            # Xray and any build/telemetry helpers belong to this session too.
+            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+        elif force:
+            process.kill()
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        pass
+
+
+def _forward_output(process, stream):
+    try:
+        for line in process.stdout:
+            if stream is not None:
+                try:
+                    stream.write(line)
+                    stream.flush()
+                except (OSError, ValueError):
+                    # Keep draining the pipe even if notebook output is closed.
+                    stream = None
+    finally:
+        process.stdout.close()
+
+
+def _watch_worker(process, stream):
+    output = threading.Thread(target=_forward_output, args=(process, stream), daemon=True)
+    output.start()
+    process.wait()
+    # Clean up immediately after exit; never signal a stale saved process ID.
+    if os.name == 'posix':
+        _signal_worker(process, force=True)
+    output.join()
+
+
+def _watch_parent(parent_pid):
+    # A notebook kernel crash bypasses atexit. Do not leave its worker mining.
+    while os.getppid() == parent_pid:
+        time.sleep(0.5)
+    os.killpg(os.getpgrp(), signal.SIGTERM)
+    time.sleep(10)
+    os.killpg(os.getpgrp(), signal.SIGKILL)
+
+
+def start(root=None, *, login_only=False):
+    """Start training without blocking the notebook; stop with stop_training().
+
+    CUDA lives in the worker, so ending it releases its tensors, allocator,
+    native caches, and CUDA context without restarting the notebook kernel.
+    """
+    global _process, _output_thread, _last_returncode
+    root = Path(root or Path(__file__).parent).resolve()
+    with _process_lock:
+        if _process is not None and _process.poll() is None:
+            raise RuntimeError('Training is already running; call stop_training() first')
+        stop_training()
+        command = [sys.executable, '-u', str(Path(__file__).resolve()), '--worker',
+                   '--root', str(root), '--parent-pid', str(os.getpid())]
+        if login_only:
+            command.append('--login-only')
+        _process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                    start_new_session=os.name == 'posix')
+        _last_returncode = None
+        _output_thread = threading.Thread(target=_watch_worker, args=(_process, sys.stdout),
+                                          name='WR-training-monitor', daemon=True)
+        _output_thread.start()
+        print(f'Training started (PID {_process.pid}). Call trainer.stop_training() to stop and release GPU memory.', flush=True)
+        return _process
+
+
+def status():
+    """Return the last worker exit code, or None while running or before start()."""
+    with _process_lock:
+        return _last_returncode if _process is None else _process.poll()
+
+
+def stop_training(timeout=10):
+    """Stop the worker and its helpers, waiting until its GPU context is gone.
+
+    Allow graceful cancellation first; force termination if it takes longer
+    than timeout seconds. Safe to call repeatedly. Returns the exit code, or
+    None when no worker has been started by this module.
+    """
+    global _process, _output_thread, _last_returncode
+    if not isinstance(timeout, (int, float)) or not 0 <= timeout < float('inf'):
+        raise ValueError('timeout must be a finite non-negative number')
+    with _process_lock:
+        process = _process
+        if process is None:
+            return None
+        if process.poll() is None:
+            _signal_worker(process)
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _signal_worker(process, force=True)
+                process.wait(timeout=5)
+        if _output_thread is not None:
+            _output_thread.join(timeout=5)
+        code = process.returncode
+        _last_returncode = code
+        _process, _output_thread = None, None
+        print(f'Training stopped (exit code {code}); worker GPU memory released.', flush=True)
+        return code
+
+
+atexit.register(stop_training)
+
+
 def run(root=None, *, login_only=False):
+    """Run in the current process; notebook callers should use start()."""
     root = Path(root or Path(__file__).parent).resolve()
     sys.path.insert(0, str(root / 'src'))
     os.environ.setdefault('LRAEP_CACHE_DIR', str(root / '.runtime/cache'))
@@ -37,4 +161,14 @@ def run(root=None, *, login_only=False):
 
 
 if __name__ == '__main__':
-    raise SystemExit(run())
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Run WR training')
+    parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--parent-pid', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--root', type=Path, default=Path(__file__).parent)
+    parser.add_argument('--login-only', action='store_true')
+    arguments = parser.parse_args()
+    if arguments.worker and arguments.parent_pid is not None and os.name == 'posix':
+        threading.Thread(target=_watch_parent, args=(arguments.parent_pid,), daemon=True).start()
+    raise SystemExit(run(arguments.root, login_only=arguments.login_only))
