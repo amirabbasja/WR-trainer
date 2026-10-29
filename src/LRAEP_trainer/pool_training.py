@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from .gpu import TrainingCancelled
 from .gpu_pacing import GpuPacer
-from .effort import EffortSchedule
+from .effort import JobSequence
 from .progress import LiveProgress
 from .protocol import TrainingConfig, load_official_helpers, pool_share_target, prepare_batch, search_batch, verified_pool_share
 from .telemetry import GpuUtilization
@@ -105,7 +105,7 @@ def run_pool_training(configuration: dict, *, login_only: bool=False) -> int:
     settings = configuration['training']
     stopped = threading.Event()
     started = time.monotonic()
-    effort = None if login_only else EffortSchedule(settings['main_effort'], started=started)
+    effort = None if login_only else JobSequence(settings['job_sequence'], started=started)
     deadline = started + settings['max_seconds'] if settings['max_seconds'] else None
     with _signal_stop(stopped, settings['max_seconds']), ExitStack() as resources:
         if effort is not None:
@@ -202,6 +202,7 @@ def _run_pool_training(configuration, *, login_only, stopped, effort, started):
                     if selected_protocol == 'WR' and (not login_only):
                         report_gpu(session, report_started)
                     previous_generation = None
+                    previous_effort = None
                     job_deadline = time.monotonic() + pool['read_timeout']
                     while not finished():
                         if effort is not None:
@@ -229,12 +230,14 @@ def _run_pool_training(configuration, *, login_only, stopped, effort, started):
                         if login_only:
                             log(logging.INFO, 'Authenticated job verified: header=%d bytes, target=%d bits; no GPU work or shares submitted', len(job.header_bytes), target.bit_length())
                             return 0
-                        utilization, boundary = effort.current()
+                        kind, utilization, boundary = effort.current_job()
                         if utilization <= 0 or expired():
                             continue
                         if pacer.max_utilization != utilization:
                             pacer.set_utilization(utilization)
-                            log(logging.INFO, 'Main effort GPU duty-cycle target: %d%%', utilization)
+                        if previous_effort != (kind, utilization):
+                            log(logging.INFO, '%s effort GPU duty-cycle target: %d%%', kind.capitalize(), utilization)
+                            previous_effort = (kind, utilization)
                         rest_deadline = min(boundary, deadline) if deadline is not None else boundary
                         cancelled = lambda: expired() or time.monotonic() >= boundary or (not session.is_current(snapshot))
                         pacer.begin()

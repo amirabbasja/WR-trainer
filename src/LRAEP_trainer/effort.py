@@ -3,17 +3,19 @@ import math
 import threading
 import time
 
-def normalize_effort(value, *, field='main_effort', allow_empty=False):
+def normalize_job_sequence(value, *, field='job_sequence'):
     if not isinstance(value, (list, tuple)):
-        raise ValueError(f'{field} must be a list of (seconds, percentage) pairs')
-    if not value and (not allow_empty):
+        raise ValueError(f'{field} must be a list of (kind, seconds, percentage) triples')
+    if not value:
         raise ValueError(f'{field} must contain at least one interval')
     entries = []
     total = 0.0
-    for pair in value:
-        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-            raise ValueError(f'{field} intervals must contain seconds and percentage')
-        seconds, percentage = pair
+    for entry in value:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+            raise ValueError(f'{field} intervals must contain kind, seconds and percentage')
+        kind, seconds, percentage = entry
+        if type(kind) is not str or kind not in ('main', 'decoy'):
+            raise ValueError(f'{field} kinds must be "main" or "decoy"')
         if type(percentage) is not int or not -1 <= percentage <= 100:
             raise ValueError(f'{field} percentages must be integers between -1 and 100')
         try:
@@ -25,20 +27,22 @@ def normalize_effort(value, *, field='main_effort', allow_empty=False):
         total += seconds
         if not math.isfinite(total):
             raise ValueError(f'{field} total duration must be finite')
-        entries.append((seconds, percentage))
+        entries.append((kind, seconds, percentage))
     return entries
 
-class EffortSchedule:
+class JobSequence:
 
-    def __init__(self, entries, *, started=None, allow_empty=False):
-        self.entries = normalize_effort(entries, allow_empty=allow_empty)
+    def __init__(self, entries, *, started=None):
+        self.entries = normalize_job_sequence(entries)
         self.started = time.monotonic() if started is None else started
-        self._total = sum((seconds for seconds, _ in self.entries))
+        self._total = sum((seconds for _, seconds, _ in self.entries))
         self._exit_offset = None
+        self._exit_kind = None
         elapsed = 0
-        for seconds, percentage in self.entries:
+        for kind, seconds, percentage in self.entries:
             if percentage == -1:
                 self._exit_offset = elapsed
+                self._exit_kind = kind
                 break
             elapsed += seconds
 
@@ -49,20 +53,22 @@ class EffortSchedule:
     def _current(self, now):
         elapsed = max(0, now - self.started)
         if self.exit_deadline is not None and now >= self.exit_deadline:
-            return (-1, math.inf)
-        if not self.entries:
-            return (0, math.inf)
+            return (self._exit_kind, -1, math.inf)
         cycle, _ = divmod(elapsed, self._total)
         boundary = 0
-        for seconds, percentage in self.entries:
+        for kind, seconds, percentage in self.entries:
             boundary += seconds
             until = self.started + cycle * self._total + boundary
             if now < until:
-                return (percentage, until)
-        until = self.started + (cycle + 1) * self._total + self.entries[0][0]
-        return (self.entries[0][1], max(until, math.nextafter(now, math.inf)))
+                return (kind, percentage, until)
+        until = self.started + (cycle + 1) * self._total + self.entries[0][1]
+        return (self.entries[0][0], self.entries[0][2], max(until, math.nextafter(now, math.inf)))
 
     def current(self):
+        _, percentage, boundary = self.current_job()
+        return (percentage, boundary)
+
+    def current_job(self):
         return self._current(time.monotonic())
 
     def ended(self):
@@ -73,7 +79,7 @@ class EffortSchedule:
             now = time.monotonic()
             if deadline is not None and now >= deadline:
                 return False
-            percentage, boundary = self._current(now)
+            _, percentage, boundary = self._current(now)
             if percentage == -1:
                 stopped.set()
                 return False

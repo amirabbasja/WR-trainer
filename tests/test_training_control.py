@@ -1,4 +1,4 @@
-"""Exercise worker shutdown without loading configuration or contacting a pool."""
+
 
 from contextlib import contextmanager, redirect_stdout
 import ctypes
@@ -29,7 +29,7 @@ class TrainingControlTests(unittest.TestCase):
         self.ready = Path(self.temporary.name) / "ready"
 
     def start_script(self, script, **options):
-        """Replace only the worker's payload; preserve real process management."""
+
         original_popen = subprocess.Popen
 
         def launch(_command, **kwargs):
@@ -102,7 +102,7 @@ class TrainingControlTests(unittest.TestCase):
 
     @contextmanager
     def adopt_test_descendant(self, pid_file):
-        """Reap the test helper after its worker exits instead of leaving a zombie."""
+
         libc = ctypes.CDLL(None, use_errno=True)
         previous = ctypes.c_int()
         self.assertEqual(libc.prctl(37, ctypes.byref(previous), 0, 0, 0), 0)
@@ -173,7 +173,7 @@ class TrainingControlTests(unittest.TestCase):
             process = self.start_script(self.descendant_script(descendant, natural_exit=True))
             self.assertEqual(process.wait(timeout=5), 7)
             child_pid = int(descendant.read_text())
-            # The monitor must clean up without an explicit stop_training() call.
+
             self.wait_dead(child_pid)
             self.assertEqual(self.trainer.status(), 7)
 

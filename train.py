@@ -18,7 +18,7 @@ _process_lock = threading.RLock()
 def _signal_worker(process, *, force=False):
     try:
         if os.name == 'posix':
-            # Xray and any build/telemetry helpers belong to this session too.
+
             os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
         elif force:
             process.kill()
@@ -36,7 +36,7 @@ def _forward_output(process, stream):
                     stream.write(line)
                     stream.flush()
                 except (OSError, ValueError):
-                    # Keep draining the pipe even if notebook output is closed.
+
                     stream = None
     finally:
         process.stdout.close()
@@ -46,14 +46,14 @@ def _watch_worker(process, stream):
     output = threading.Thread(target=_forward_output, args=(process, stream), daemon=True)
     output.start()
     process.wait()
-    # Clean up immediately after exit; never signal a stale saved process ID.
+
     if os.name == 'posix':
         _signal_worker(process, force=True)
     output.join()
 
 
 def _watch_parent(parent_pid):
-    # A notebook kernel crash bypasses atexit. Do not leave its worker mining.
+
     while os.getppid() == parent_pid:
         time.sleep(0.5)
     os.killpg(os.getpgrp(), signal.SIGTERM)
@@ -62,11 +62,11 @@ def _watch_parent(parent_pid):
 
 
 def start(root=None, *, login_only=False):
-    """Start training without blocking the notebook; stop with stop_training().
 
-    CUDA lives in the worker, so ending it releases its tensors, allocator,
-    native caches, and CUDA context without restarting the notebook kernel.
-    """
+
+
+
+
     global _process, _output_thread, _last_returncode
     root = Path(root or Path(__file__).parent).resolve()
     with _process_lock:
@@ -89,18 +89,18 @@ def start(root=None, *, login_only=False):
 
 
 def status():
-    """Return the last worker exit code, or None while running or before start()."""
+
     with _process_lock:
         return _last_returncode if _process is None else _process.poll()
 
 
 def stop_training(timeout=10):
-    """Stop the worker and its helpers, waiting until its GPU context is gone.
 
-    Allow graceful cancellation first; force termination if it takes longer
-    than timeout seconds. Safe to call repeatedly. Returns the exit code, or
-    None when no worker has been started by this module.
-    """
+
+
+
+
+
     global _process, _output_thread, _last_returncode
     if not isinstance(timeout, (int, float)) or not 0 <= timeout < float('inf'):
         raise ValueError('timeout must be a finite non-negative number')
@@ -128,7 +128,7 @@ atexit.register(stop_training)
 
 
 def run(root=None, *, login_only=False):
-    """Run in the current process; notebook callers should use start()."""
+
     root = Path(root or Path(__file__).parent).resolve()
     sys.path.insert(0, str(root / 'src'))
     os.environ.setdefault('LRAEP_CACHE_DIR', str(root / '.runtime/cache'))
@@ -140,7 +140,7 @@ def run(root=None, *, login_only=False):
         from LRAEP_trainer.pool_training import run_pool_training, validate_pool_endpoint, validate_pool_identity
         from LRAEP_trainer.vpn import ManagedVPN
         config = load_config(root / 'config.json')
-        if not login_only and config['training']['main_effort'][0][1] == -1:
+        if not login_only and config['training']['job_sequence'][0][2] == -1:
             return 0
         config['pool'] = resolve_pool_settings(config['pool'])
         if config['pool']['protocol'] != 'WR':

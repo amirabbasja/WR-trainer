@@ -8,13 +8,13 @@ import re
 import tempfile
 from urllib.parse import urlsplit
 from .config_export import ExportError, decode_config_document, encode_config_document, read_open_text
-from .effort import normalize_effort
+from .effort import normalize_job_sequence
 from .paths import artifacts_dir
 
 class ConfigError(RuntimeError):
     pass
 _TOP_LEVEL = {'version', 'mode', 'official_source', 'device', 'training', 'pool', 'node', 'vpn'}
-_TRAINING_DEFAULTS = {'m': 256, 'n': 256, 'k': 2048, 'tile_h': 8, 'tile_w': 8, 'max_batches': 0, 'max_seconds': 0, 'main_effort': [[60, 80], [120, 70], [180, 10]], 'decoy_effort': [], 'output_dir': str(artifacts_dir())}
+_TRAINING_DEFAULTS = {'m': 256, 'n': 256, 'k': 2048, 'tile_h': 8, 'tile_w': 8, 'max_batches': 0, 'max_seconds': 0, 'job_sequence': [['main', 60, 80], ['main', 120, 70], ['main', 180, 10]], 'output_dir': str(artifacts_dir())}
 _POOL_DEFAULTS = {'host': '', 'port': 7048, 'tls': False, 'ca_file': None, 'WR_wallet': '', 'KEX_uname': '', 'worker': 'rig-01', 'password': 'x', 'connect_timeout': 15, 'read_timeout': 60, 'reconnect_delay': 3, 'protocol': 'WR', 'compression': 'none', 'certificate_version': None, 'agent': 'LRAEP-trainer/0.1', 'stop_on_unknown_request': True, 'unknown_request_dir': None, 'protocol_documentation': None}
 _POOL_PROFILES = ('KEX', 'WR')
 _POOL_CONNECTION_FIELDS = {'host', 'port', 'tls', 'ca_file', 'compression', 'certificate_version', 'protocol_documentation'}
@@ -252,21 +252,24 @@ def _validate_config(config, config_path) -> dict:
         raise ConfigError('device must select CUDA, for example cuda:0')
     directory = config_path.parent
     official_source = _path(config.get('official_source', 'src/LRAEP_helpers'), 'official_source', directory)
-    raw_training = _section(config.get('training', {}),
+    raw_training = config.get('training', {})
+    if isinstance(raw_training, dict) and {'main_effort', 'decoy_effort'} & raw_training.keys():
+        raise ConfigError('training.main_effort and training.decoy_effort were replaced by training.job_sequence')
+    raw_training = _section(raw_training,
                             set(_TRAINING_DEFAULTS) | {'max_gpu_utilization'}, 'training')
     training = copy.deepcopy(_TRAINING_DEFAULTS)
     training.update({field: value for field, value in raw_training.items()
                      if field != 'max_gpu_utilization'})
     if 'max_gpu_utilization' in raw_training:
         legacy = _integer(raw_training['max_gpu_utilization'], 'training.max_gpu_utilization', 1, 100)
-        if 'main_effort' not in raw_training:
-            training['main_effort'] = [[60, legacy]]
-    for field in ('main_effort', 'decoy_effort'):
-        try:
-            training[field] = normalize_effort(training[field], field=f'training.{field}',
-                                               allow_empty=field == 'decoy_effort')
-        except ValueError as exc:
-            raise ConfigError(str(exc)) from None
+        if 'job_sequence' not in raw_training:
+            training['job_sequence'] = [['main', 60, legacy]]
+    try:
+        training['job_sequence'] = normalize_job_sequence(
+            training['job_sequence'], field='training.job_sequence',
+        )
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from None
     for field in ('m', 'n'):
         _integer(training[field], f'training.{field}', 128, 4096)
     _integer(training['k'], 'training.k', 2048, 65536)
