@@ -2,7 +2,8 @@ import os
 import re
 import subprocess
 import threading
-_SAMPLE_INTERVAL = 1.0
+import time
+_SAMPLE_INTERVAL = 0.2
 _QUERY_TIMEOUT = 0.75
 _UUID = re.compile('(?:GPU-|MIG-)?[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}')
 
@@ -53,6 +54,7 @@ class GpuUtilization:
     def __init__(self, device: str):
         self.device = device
         self._value = None
+        self._sampled_at = None
         self._lock = threading.Lock()
         self._stopped = threading.Event()
         self._thread = None
@@ -72,12 +74,17 @@ class GpuUtilization:
             value = _query_gpu_utilization(identifier)
             with self._lock:
                 self._value = value
+                self._sampled_at = time.monotonic() if value is not None else None
             if self._stopped.wait(_SAMPLE_INTERVAL):
                 return
 
     def read(self) -> int | None:
         with self._lock:
             return self._value
+
+    def read_sample(self):
+        with self._lock:
+            return self._value, self._sampled_at
 
     def close(self):
         self._stopped.set()

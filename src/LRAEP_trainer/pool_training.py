@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from .gpu import TrainingCancelled
 from .gpu_pacing import GpuPacer
-from .effort import JobSequence
+from .effort import JobSequence, ScheduledSideJob
 from .progress import LiveProgress
 from .protocol import TrainingConfig, load_official_helpers, pool_share_target, prepare_batch, search_batch, verified_pool_share
 from .telemetry import GpuUtilization
@@ -167,9 +167,26 @@ def _run_pool_training(configuration, *, login_only, stopped, effort, started):
         if not login_only:
             monitor = GpuUtilization(str(device)).start()
             resources.callback(monitor.close)
+            pacer.set_monitor(monitor.read_sample)
+
+        active_job = 'main'
+
+        def show_side_job(job):
+            nonlocal active_job
+            force = active_job != 'side-job'
+            active_job = 'side-job'
+            progress.update(job.status(monitor.read() if monitor is not None else None), force=force)
+
+        side_job = (ScheduledSideJob(configuration, before_log=progress.clear, on_progress=show_side_job)
+                    if not login_only else None)
+        if side_job is not None:
+            resources.callback(side_job.close)
 
         def update_progress(force=False):
+            nonlocal active_job
             if monitor is not None:
+                force = force or active_job != 'main'
+                active_job = 'main'
                 progress.update(pool_status(stats, cfg, time.monotonic() - started, monitor.read()), force=force)
 
         def log(level, message, *args):
@@ -184,6 +201,8 @@ def _run_pool_training(configuration, *, login_only, stopped, effort, started):
         while not finished():
             if effort is not None and (not effort.wait(stopped, deadline=deadline)):
                 break
+            if side_job is not None and side_job.run_if_active(effort, stopped, pacer, deadline=deadline):
+                continue
             session = None
             try:
                 session_settings = dict(pool)
@@ -211,6 +230,9 @@ def _run_pool_training(configuration, *, login_only, stopped, effort, started):
                                 break
                             if paused:
                                 job_deadline = time.monotonic() + pool['read_timeout']
+                        if side_job is not None and side_job.run_if_active(effort, stopped, pacer, deadline=deadline):
+                            job_deadline = time.monotonic() + pool['read_timeout']
+                            continue
                         update_progress()
                         snapshot = session.wait_job(timeout=0.25)
                         if snapshot is None:
@@ -231,10 +253,12 @@ def _run_pool_training(configuration, *, login_only, stopped, effort, started):
                             log(logging.INFO, 'Authenticated job verified: header=%d bytes, target=%d bits; no GPU work or shares submitted', len(job.header_bytes), target.bit_length())
                             return 0
                         kind, utilization, boundary = effort.current_job()
-                        if utilization <= 0 or expired():
+                        if kind != 'main' or utilization <= 0 or expired():
                             continue
                         if pacer.max_utilization != utilization:
                             pacer.set_utilization(utilization)
+                        if type(effort.ceiling) is int:
+                            pacer.set_ceiling(effort.ceiling)
                         if previous_effort != (kind, utilization):
                             log(logging.INFO, '%s effort GPU duty-cycle target: %d%%', kind.capitalize(), utilization)
                             previous_effort = (kind, utilization)
@@ -315,7 +339,10 @@ def _run_pool_training(configuration, *, login_only, stopped, effort, started):
                 if limit > 0:
                     delay = min(delay, max(0, limit - (time.monotonic() - started)))
                 stopped.wait(delay)
-        update_progress(force=True)
+        if active_job == 'side-job' and side_job is not None and side_job.job is not None:
+            progress.update(side_job.job.status(monitor.read()), force=True)
+        else:
+            update_progress(force=True)
     LOG.info('Pool training stopped: batches=%d submitted=%d accepted=%d rejected=%d stale=%d', stats.batches, stats.submitted, stats.accepted, stats.rejected, stats.stale)
     if login_only:
         raise RuntimeError('no authenticated pool job was received before stopping')

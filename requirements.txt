@@ -5,3 +5,5 @@ pydantic>=2.12.5
 loguru>=0.7.0
 cryptography>=46.0.0
 ipykernel>=6
+Pillow>=10.4
+pyarrow>=18.0

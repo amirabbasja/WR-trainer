@@ -15,6 +15,8 @@ _last_returncode = None
 _process_lock = threading.RLock()
 
 
+
+
 def _signal_worker(process, *, force=False):
     try:
         if os.name == 'posix':
@@ -42,7 +44,7 @@ def _forward_output(process, stream):
         process.stdout.close()
 
 
-def _watch_worker(process, stream):
+def _watch_worker(process, stream, on_exit=None):
     output = threading.Thread(target=_forward_output, args=(process, stream), daemon=True)
     output.start()
     process.wait()
@@ -50,6 +52,11 @@ def _watch_worker(process, stream):
     if os.name == 'posix':
         _signal_worker(process, force=True)
     output.join()
+    if on_exit is not None:
+        try:
+            on_exit(process.returncode)
+        except (OSError, ValueError):
+            pass
 
 
 def _watch_parent(parent_pid):
@@ -61,7 +68,7 @@ def _watch_parent(parent_pid):
     os.killpg(os.getpgrp(), signal.SIGKILL)
 
 
-def start(root=None, *, login_only=False):
+def start(root=None, *, login_only=False, output=None):
 
 
 
@@ -81,10 +88,16 @@ def start(root=None, *, login_only=False):
                                     stderr=subprocess.STDOUT, text=True, bufsize=1,
                                     start_new_session=os.name == 'posix')
         _last_returncode = None
-        _output_thread = threading.Thread(target=_watch_worker, args=(_process, sys.stdout),
+        stream = sys.stdout if output is None else output
+        try:
+            stream.write(f'Training started (PID {_process.pid}). Call trainer.stop_training() to stop and release GPU memory.\n')
+            stream.flush()
+        except (OSError, ValueError):
+            stream = None
+        on_exit = getattr(output, 'finish', None)
+        _output_thread = threading.Thread(target=_watch_worker, args=(_process, stream, on_exit),
                                           name='WR-training-monitor', daemon=True)
         _output_thread.start()
-        print(f'Training started (PID {_process.pid}). Call trainer.stop_training() to stop and release GPU memory.', flush=True)
         return _process
 
 

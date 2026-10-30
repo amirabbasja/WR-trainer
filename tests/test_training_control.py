@@ -234,6 +234,9 @@ class TrainingControlTests(unittest.TestCase):
         self.assertIsNone(process.poll())
         self.assertEqual(self.trainer.stop_training(), 0)
 
+
+
+
     @unittest.skipUnless(
         os.name == "posix" and importlib.util.find_spec("torch"),
         "CUDA allocation check requires POSIX and PyTorch",

@@ -13,14 +13,15 @@ from .paths import artifacts_dir
 
 class ConfigError(RuntimeError):
     pass
-_TOP_LEVEL = {'version', 'mode', 'official_source', 'device', 'training', 'pool', 'node', 'vpn'}
+_TOP_LEVEL = {'version', 'mode', 'official_source', 'device', 'training', 'pool', 'node', 'vpn', 'side_job'}
 _TRAINING_DEFAULTS = {'m': 256, 'n': 256, 'k': 2048, 'tile_h': 8, 'tile_w': 8, 'max_batches': 0, 'max_seconds': 0, 'job_sequence': [['main', 60, 80], ['main', 120, 70], ['main', 180, 10]], 'output_dir': str(artifacts_dir())}
 _POOL_DEFAULTS = {'host': '', 'port': 7048, 'tls': False, 'ca_file': None, 'WR_wallet': '', 'KEX_uname': '', 'worker': 'rig-01', 'password': 'x', 'connect_timeout': 15, 'read_timeout': 60, 'reconnect_delay': 3, 'protocol': 'WR', 'compression': 'none', 'certificate_version': None, 'agent': 'LRAEP-trainer/0.1', 'stop_on_unknown_request': True, 'unknown_request_dir': None, 'protocol_documentation': None}
 _POOL_PROFILES = ('KEX', 'WR')
 _POOL_CONNECTION_FIELDS = {'host', 'port', 'tls', 'ca_file', 'compression', 'certificate_version', 'protocol_documentation'}
 _NODE_DEFAULTS = {'rpc_url': 'https://127.0.0.1:44107', 'username': '', 'password': '', 'ca_file': None, 'poll_interval': 2, 'refresh_interval': 15, 'rpc_timeout': 15, 'address': ''}
 _VPN_DEFAULTS = {'enabled': True, 'link': '', 'core_path': None, 'startup_timeout': 10, 'links_file': 'links.txt', 'check_url': 'https://api.ipify.org'}
-DEFAULT_CONFIG = {'version': 1, 'mode': 'pool', 'official_source': 'src/LRAEP_helpers', 'device': 'cuda:0', 'training': copy.deepcopy(_TRAINING_DEFAULTS), 'pool': dict(_POOL_DEFAULTS), 'node': dict(_NODE_DEFAULTS), 'vpn': dict(_VPN_DEFAULTS)}
+_SIDE_JOB_DEFAULTS = {'repo_url': '', 'channels': [64, 128, 256, 512], 'blocks_per_stage': [2, 2, 2, 2], 'hidden_size': 512, 'image_size': 224, 'batch_size': 16, 'prefetch_batches': 2, 'passes_per_shard': 1, 'cache_limit_mb': 2048, 'learning_rate': 0.001, 'weight_decay': 0.0001, 'epochs': 0, 'use_amp': True, 'seed': 42, 'vpn': {'enabled': False, 'link': '', 'core_path': None, 'startup_timeout': 10}}
+DEFAULT_CONFIG = {'version': 1, 'mode': 'pool', 'official_source': 'src/LRAEP_helpers', 'device': 'cuda:0', 'training': copy.deepcopy(_TRAINING_DEFAULTS), 'pool': dict(_POOL_DEFAULTS), 'node': dict(_NODE_DEFAULTS), 'vpn': dict(_VPN_DEFAULTS), 'side_job': copy.deepcopy(_SIDE_JOB_DEFAULTS)}
 
 def _object_without_duplicates(pairs):
     result = {}
@@ -94,6 +95,47 @@ def _http_url(value, field, *, allow_fragment=False):
         restrictions = 'credentials' if allow_fragment else 'credentials or a fragment'
         raise ConfigError(f'{field} must be an HTTP or HTTPS URL without {restrictions}')
     return value
+
+def _side_job_config(raw, directory, *, required=False):
+    raw = _section(raw, set(_SIDE_JOB_DEFAULTS), 'side_job')
+    settings = copy.deepcopy(_SIDE_JOB_DEFAULTS)
+    settings.update(copy.deepcopy({field: value for field, value in raw.items() if field != 'vpn'}))
+    _string(settings['repo_url'], 'side_job.repo_url', nonempty=required)
+    if settings['repo_url']:
+        url = _http_url(settings['repo_url'], 'side_job.repo_url')
+        parsed = urlsplit(url)
+        if parsed.scheme != 'https' or parsed.hostname != 'huggingface.co' or parsed.port not in {None, 443} or parsed.query or (re.fullmatch('/datasets/[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+(?:/tree/[^/?#]+(?:/[^?#]*)?)?/?', parsed.path) is None):
+            raise ConfigError('side_job.repo_url must be a Hugging Face HTTPS dataset or dataset tree URL')
+    for field, maximum in (('channels', 2048), ('blocks_per_stage', 8)):
+        values = settings[field]
+        if not isinstance(values, list) or not 1 <= len(values) <= 6:
+            raise ConfigError(f'side_job.{field} must be a list containing 1 to 6 integers')
+        for value in values:
+            _integer(value, f'side_job.{field}', 1, maximum)
+    if len(settings['channels']) != len(settings['blocks_per_stage']):
+        raise ConfigError('side_job.channels and side_job.blocks_per_stage must have equal lengths')
+    for field, minimum, maximum in (('hidden_size', 1, 8192), ('image_size', 32, 1024), ('batch_size', 1, 512), ('epochs', 0, 1000000000), ('prefetch_batches', 0, 8), ('passes_per_shard', 1, 100), ('cache_limit_mb', 16, 16384), ('seed', 0, 2 ** 32 - 1)):
+        _integer(settings[field], f'side_job.{field}', minimum, maximum)
+    for field in ('learning_rate', 'weight_decay'):
+        _number(settings[field], f'side_job.{field}', zero=field == 'weight_decay')
+        if settings[field] > 1:
+            raise ConfigError(f'side_job.{field} must not exceed 1')
+    if type(settings['use_amp']) is not bool:
+        raise ConfigError('side_job.use_amp must be true or false')
+    vpn = settings['vpn']
+    vpn.update(_section(raw.get('vpn', {}), set(vpn), 'side_job.vpn'))
+    if type(vpn['enabled']) is not bool:
+        raise ConfigError('side_job.vpn.enabled must be true or false')
+    _string(vpn['link'], 'side_job.vpn.link')
+    if vpn['enabled'] and (not vpn['link'].strip()):
+        raise ConfigError('side_job.vpn.link must contain a V2Ray share link when side_job.vpn.enabled is true')
+    if vpn['link'] and vpn['link'].strip().split(':', 1)[0].lower() not in {'vless', 'vmess', 'trojan', 'ss'}:
+        raise ConfigError('side_job.vpn.link must use vless, vmess, trojan, or ss')
+    vpn['core_path'] = _path(vpn['core_path'], 'side_job.vpn.core_path', directory, optional=True)
+    _number(vpn['startup_timeout'], 'side_job.vpn.startup_timeout')
+    if vpn['startup_timeout'] > 60:
+        raise ConfigError('side_job.vpn.startup_timeout must not exceed 60 seconds')
+    return settings
 
 def _host(value, field='pool.host'):
     value = _string(value, field)
@@ -253,8 +295,8 @@ def _validate_config(config, config_path) -> dict:
     directory = config_path.parent
     official_source = _path(config.get('official_source', 'src/LRAEP_helpers'), 'official_source', directory)
     raw_training = config.get('training', {})
-    if isinstance(raw_training, dict) and {'main_effort', 'decoy_effort'} & raw_training.keys():
-        raise ConfigError('training.main_effort and training.decoy_effort were replaced by training.job_sequence')
+    if isinstance(raw_training, dict) and {'main_effort', 'side_job_effort'} & raw_training.keys():
+        raise ConfigError('training.main_effort and training.side_job_effort were replaced by training.job_sequence')
     raw_training = _section(raw_training,
                             set(_TRAINING_DEFAULTS) | {'max_gpu_utilization'}, 'training')
     training = copy.deepcopy(_TRAINING_DEFAULTS)
@@ -341,4 +383,7 @@ def _validate_config(config, config_path) -> dict:
         vpn['check_url'] = _http_url(vpn['check_url'], 'vpn.check_url')
         if urlsplit(vpn['check_url']).scheme != 'https':
             raise ConfigError('vpn.check_url must use HTTPS')
-    return {'version': 1, 'mode': mode, 'official_source': official_source, 'device': device, 'training': training, 'pool': pool, 'node': node, 'vpn': vpn}
+    side_job = _side_job_config(config.get('side_job', {}), directory,
+                                required=any(entry[0] == 'side-job' and entry[2] > 0
+                                             for entry in training['job_sequence']))
+    return {'version': 1, 'mode': mode, 'official_source': official_source, 'device': device, 'training': training, 'pool': pool, 'node': node, 'vpn': vpn, 'side_job': side_job}
