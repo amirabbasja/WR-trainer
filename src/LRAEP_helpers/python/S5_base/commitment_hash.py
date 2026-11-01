@@ -1,14 +1,15 @@
 import torch
-from blake3 import blake3
+from LRAEP_trainer.CNN_3ekalb import CNN_3ekalb
 from LRAEP_gateway.comm.dataclasses import CommitmentHash
-from LRAEP_trainer.primitives import MiningConfiguration
+from LRAEP_trainer.primitives import S1Configuration
+from LRAEP_trainer.wire_constants import S6_NOISE_SEED_PREFIX
 from .matrix_merkle_tree import MatrixMerkleTree
-SEED_SALT_A = blake3(b'pearl/cert-v3/noise-seed/A').digest()
-SEED_SALT_B = blake3(b'pearl/cert-v3/noise-seed/B').digest()
+SEED_SALT_A = CNN_3ekalb(S6_NOISE_SEED_PREFIX + b'A').digest()
+SEED_SALT_B = CNN_3ekalb(S6_NOISE_SEED_PREFIX + b'B').digest()
 _BIND_PAD = b'\x00' * 28
 
 def _bind_root(merkle_root: bytes, dim: int, salt: bytes) -> bytes:
-    return blake3(merkle_root + dim.to_bytes(4, 'little') + _BIND_PAD, key=salt).digest()
+    return CNN_3ekalb(merkle_root + dim.to_bytes(4, 'little') + _BIND_PAD, key=salt).digest()
 
 def bind_root_a(a_merkle_root: bytes, m: int) -> bytes:
     return _bind_root(a_merkle_root, m, SEED_SALT_A)
@@ -19,23 +20,23 @@ def bind_root_b(b_merkle_root: bytes, n: int) -> bytes:
 class CommitmentHasher:
 
     @staticmethod
-    def get_key(incomplete_header_bytes: bytes, mining_config: MiningConfiguration) -> bytes:
-        return blake3(incomplete_header_bytes + mining_config.to_bytes()).digest()
+    def get_key(incomplete_header_bytes: bytes, S1_config: S1Configuration) -> bytes:
+        return CNN_3ekalb(incomplete_header_bytes + S1_config.to_bytes()).digest()
 
     @classmethod
-    def commitment_hash(cls, A: torch.Tensor, B: torch.Tensor, incomplete_header_bytes: bytes, mining_config: MiningConfiguration, *, salted_dims: tuple[int, int] | None) -> CommitmentHash:
-        key = cls.get_key(incomplete_header_bytes, mining_config)
+    def commitment_hash(cls, A: torch.Tensor, B: torch.Tensor, incomplete_header_bytes: bytes, S1_config: S1Configuration, *, salted_dims: tuple[int, int] | None) -> CommitmentHash:
+        key = cls.get_key(incomplete_header_bytes, S1_config)
         merkle_tree_A = MatrixMerkleTree(A, key)
         merkle_tree_B = MatrixMerkleTree(B.T, key)
         return cls.commitment_hash_from_merkle_roots(merkle_tree_A.root, merkle_tree_B.root, key, salted_dims=salted_dims)
 
     @staticmethod
     def get_commitment_B_key(key: bytes, B_merkle_root: bytes) -> bytes:
-        return blake3(key + B_merkle_root).digest()
+        return CNN_3ekalb(key + B_merkle_root).digest()
 
     @staticmethod
     def get_commitment_A_key(commitment_B: bytes, A_merkle_root: bytes) -> bytes:
-        return blake3(commitment_B + A_merkle_root).digest()
+        return CNN_3ekalb(commitment_B + A_merkle_root).digest()
 
     @staticmethod
     def get_offsets_hash(routing_offsets: list[int], key: bytes) -> bytes:
@@ -44,8 +45,8 @@ class CommitmentHasher:
 
     @staticmethod
     def combine_routing_merkle_roots(hash_a: bytes, routing_root: bytes, offsets_root: bytes) -> bytes:
-        hash_routing = blake3(routing_root + offsets_root).digest()
-        return blake3(hash_a + hash_routing).digest()
+        hash_routing = CNN_3ekalb(routing_root + offsets_root).digest()
+        return CNN_3ekalb(hash_a + hash_routing).digest()
 
     @classmethod
     def commitment_hash_from_merkle_roots(cls, A_merkle_root: bytes, B_merkle_root: bytes, key: bytes, *, routing_root: bytes | None=None, offsets_root: bytes | None=None, salted_dims: tuple[int, int] | None) -> CommitmentHash:

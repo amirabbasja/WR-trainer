@@ -10,18 +10,23 @@ from urllib.parse import urlsplit
 from .config_export import ExportError, decode_config_document, encode_config_document, read_open_text
 from .effort import normalize_job_sequence
 from .paths import artifacts_dir
+from .wire_constants import S7_LEGACY_ALIAS
 
 class ConfigError(RuntimeError):
     pass
-_TOP_LEVEL = {'version', 'mode', 'official_source', 'device', 'training', 'pool', 'node', 'vpn', 'side_job'}
+_TOP_LEVEL = {'version', 'mode', 'official_source', 'device', 'training', 'S3', 'node', 'vpn', 'side_job', 'trainer_name', 'telegram'}
+_TELEGRAM_DEFAULTS = {
+    'enabled': False, 'tgBot_key': '', 'tgChatID': '',
+    'update_interval_seconds': 300,
+}
 _TRAINING_DEFAULTS = {'m': 256, 'n': 256, 'k': 2048, 'tile_h': 8, 'tile_w': 8, 'max_batches': 0, 'max_seconds': 0, 'job_sequence': [['main', 60, 80], ['main', 120, 70], ['main', 180, 10]], 'output_dir': str(artifacts_dir())}
-_POOL_DEFAULTS = {'host': '', 'port': 7048, 'tls': False, 'ca_file': None, 'WR_wallet': '', 'KEX_uname': '', 'worker': 'rig-01', 'password': 'x', 'connect_timeout': 15, 'read_timeout': 60, 'reconnect_delay': 3, 'protocol': 'WR', 'compression': 'none', 'certificate_version': None, 'agent': 'LRAEP-trainer/0.1', 'stop_on_unknown_request': True, 'unknown_request_dir': None, 'protocol_documentation': None}
-_POOL_PROFILES = ('KEX', 'WR')
-_POOL_CONNECTION_FIELDS = {'host', 'port', 'tls', 'ca_file', 'compression', 'certificate_version', 'protocol_documentation'}
+_S3_DEFAULTS = {'host': '', 'port': 7048, 'tls': False, 'ca_file': None, 'WR_S2': '', 'KEX_uname': '', 'worker': 'rig-01', 'password': 'x', 'connect_timeout': 15, 'read_timeout': 60, 'reconnect_delay': 3, 'protocol': 'WR', 'compression': 'none', 'certificate_version': None, 'agent': 'LRAEP-trainer/0.1', 'stop_on_unknown_request': True, 'unknown_request_dir': None, 'protocol_documentation': None}
+_S3_PROFILES = ('KEX', 'WR')
+_S3_CONNECTION_FIELDS = {'host', 'port', 'tls', 'ca_file', 'compression', 'certificate_version', 'protocol_documentation'}
 _NODE_DEFAULTS = {'rpc_url': 'https://127.0.0.1:44107', 'username': '', 'password': '', 'ca_file': None, 'poll_interval': 2, 'refresh_interval': 15, 'rpc_timeout': 15, 'address': ''}
 _VPN_DEFAULTS = {'enabled': True, 'link': '', 'core_path': None, 'startup_timeout': 10, 'links_file': 'links.txt', 'check_url': 'https://api.ipify.org'}
 _SIDE_JOB_DEFAULTS = {'repo_url': '', 'channels': [64, 128, 256, 512], 'blocks_per_stage': [2, 2, 2, 2], 'hidden_size': 512, 'image_size': 224, 'batch_size': 16, 'prefetch_batches': 2, 'passes_per_shard': 1, 'cache_limit_mb': 2048, 'learning_rate': 0.001, 'weight_decay': 0.0001, 'epochs': 0, 'use_amp': True, 'seed': 42, 'vpn': {'enabled': False, 'link': '', 'core_path': None, 'startup_timeout': 10}}
-DEFAULT_CONFIG = {'version': 1, 'mode': 'pool', 'official_source': 'src/LRAEP_helpers', 'device': 'cuda:0', 'training': copy.deepcopy(_TRAINING_DEFAULTS), 'pool': dict(_POOL_DEFAULTS), 'node': dict(_NODE_DEFAULTS), 'vpn': dict(_VPN_DEFAULTS), 'side_job': copy.deepcopy(_SIDE_JOB_DEFAULTS)}
+DEFAULT_CONFIG = {'version': 1, 'mode': 'S3', 'official_source': 'src/LRAEP_helpers', 'device': 'cuda:0', 'training': copy.deepcopy(_TRAINING_DEFAULTS), 'S3': dict(_S3_DEFAULTS), 'node': dict(_NODE_DEFAULTS), 'vpn': dict(_VPN_DEFAULTS), 'side_job': copy.deepcopy(_SIDE_JOB_DEFAULTS), 'trainer_name': 'LRAEP-WR-Trainer', 'telegram': dict(_TELEGRAM_DEFAULTS)}
 
 def _object_without_duplicates(pairs):
     result = {}
@@ -81,6 +86,29 @@ def _path(value, field, directory, *, optional=False):
     except (OSError, RuntimeError, ValueError):
         raise ConfigError(f'{field} is not a valid filesystem path') from None
 
+def _telegram_config(config):
+    name = _string(config.get("trainer_name", DEFAULT_CONFIG["trainer_name"]),
+                   "trainer_name", nonempty=True)
+    if len(name) > 128:
+        raise ConfigError("trainer_name must contain at most 128 characters")
+    settings = dict(_TELEGRAM_DEFAULTS)
+    settings.update(_section(config.get("telegram", {}), set(settings), "telegram"))
+    if type(settings["enabled"]) is not bool:
+        raise ConfigError("telegram.enabled must be true or false")
+    token = _string(settings["tgBot_key"], "telegram.tgBot_key")
+    if token and re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token) is None:
+        raise ConfigError("telegram.tgBot_key must be a valid bot token")
+    chat_id = settings["tgChatID"]
+    if type(chat_id) is not int:
+        _string(chat_id, "telegram.tgChatID")
+        if chat_id and re.fullmatch(r"-?[0-9]+|@[A-Za-z0-9_]+", chat_id) is None:
+            raise ConfigError("telegram.tgChatID must be a chat ID or channel username")
+    if settings["enabled"] and (not token or not chat_id):
+        raise ConfigError("telegram.enabled requires telegram.tgBot_key and telegram.tgChatID")
+    _number(settings["update_interval_seconds"], "telegram.update_interval_seconds")
+    return name, settings
+
+
 def _http_url(value, field, *, allow_fragment=False):
     value = _string(value, field, nonempty=True)
     try:
@@ -137,7 +165,7 @@ def _side_job_config(raw, directory, *, required=False):
         raise ConfigError('side_job.vpn.startup_timeout must not exceed 60 seconds')
     return settings
 
-def _host(value, field='pool.host'):
+def _host(value, field='S3.host'):
     value = _string(value, field)
     if not value:
         return value
@@ -155,7 +183,7 @@ def _host(value, field='pool.host'):
         raise ConfigError(f'{field} is not a valid hostname or IP address')
     return value
 
-def _documentation(value, directory, field='pool.protocol_documentation'):
+def _documentation(value, directory, field='S3.protocol_documentation'):
     if value is None:
         return None
     value = _string(value, field, nonempty=True)
@@ -163,14 +191,14 @@ def _documentation(value, directory, field='pool.protocol_documentation'):
         return _http_url(value, field, allow_fragment=True)
     return _path(value, field, directory)
 
-def _pool_protocol(value):
+def _S3_protocol(value):
     if value == 'auto':
-        raise ConfigError('pool.protocol must explicitly select KEX or WR; automatic detection is unavailable')
-    if not isinstance(value, str) or value not in {'KEX', 'WR', 'pearlhash'}:
-        raise ConfigError('pool.protocol must select KEX or WR')
-    return 'WR' if value == 'pearlhash' else value
+        raise ConfigError('S3.protocol must explicitly select KEX or WR; automatic detection is unavailable')
+    if not isinstance(value, str) or value not in {'KEX', 'WR', 'S7', S7_LEGACY_ALIAS}:
+        raise ConfigError('S3.protocol must select KEX or WR')
+    return 'WR' if value in {'S7', S7_LEGACY_ALIAS} else value
 
-def _validate_pool_connection(settings, section, directory):
+def _validate_S3_connection(settings, section, directory):
     settings['host'] = _host(settings['host'], f'{section}.host')
     _integer(settings['port'], f'{section}.port', 1, 65535)
     if type(settings['tls']) is not bool:
@@ -184,20 +212,20 @@ def _validate_pool_connection(settings, section, directory):
         _integer(settings['certificate_version'], f'{section}.certificate_version', 1, 3)
     settings['protocol_documentation'] = _documentation(settings['protocol_documentation'], directory, f'{section}.protocol_documentation')
 
-def resolve_pool_settings(settings: dict, miner: str | None=None) -> dict:
+def resolve_S3_settings(settings: dict, S5: str | None=None) -> dict:
     if not isinstance(settings, dict):
-        raise ConfigError('pool must be an object')
-    selected = _pool_protocol(settings.get('protocol', 'KEX') if miner is None else miner)
-    effective = copy.deepcopy(_POOL_DEFAULTS)
+        raise ConfigError('S3 must be an object')
+    selected = _S3_protocol(settings.get('protocol', 'KEX') if S5 is None else S5)
+    effective = copy.deepcopy(_S3_DEFAULTS)
     effective.update(copy.deepcopy(settings))
-    if any((name in settings for name in _POOL_PROFILES)):
-        for name in _POOL_PROFILES:
+    if any((name in settings for name in _S3_PROFILES)):
+        for name in _S3_PROFILES:
             if name in settings:
-                _section(settings[name], _POOL_CONNECTION_FIELDS, f'pool.{name}')
-        for field in _POOL_CONNECTION_FIELDS:
-            effective[field] = _POOL_DEFAULTS[field]
+                _section(settings[name], _S3_CONNECTION_FIELDS, f'S3.{name}')
+        for field in _S3_CONNECTION_FIELDS:
+            effective[field] = _S3_DEFAULTS[field]
         effective.update(copy.deepcopy(settings.get(selected, {})))
-    for name in _POOL_PROFILES:
+    for name in _S3_PROFILES:
         effective.pop(name, None)
     effective['protocol'] = selected
     return effective
@@ -284,11 +312,12 @@ def update_config(path, changes: dict, *, key=None) -> None:
 
 def _validate_config(config, config_path) -> dict:
     config = _section(config, _TOP_LEVEL, 'configuration')
+    trainer_name, telegram = _telegram_config(config)
     if 'version' not in config or type(config['version']) is not int or config['version'] != 1:
         raise ConfigError('configuration.version must be the integer 1')
-    mode = config.get('mode', 'pool')
-    if mode != 'pool':
-        raise ConfigError('configuration.mode must be pool')
+    mode = config.get('mode', 'S3')
+    if mode != 'S3':
+        raise ConfigError('configuration.mode must be S3')
     device = _string(config.get('device', 'cuda:0'), 'device', nonempty=True)
     if re.fullmatch('cuda(?::[0-9]+)?', device) is None:
         raise ConfigError('device must select CUDA, for example cuda:0')
@@ -326,33 +355,33 @@ def _validate_config(config, config_path) -> dict:
     if training['m'] % training['tile_h'] or training['n'] % training['tile_w']:
         raise ConfigError('training matrix dimensions must be divisible by their tile dimensions')
     if (training['tile_h'] + training['tile_w']) * training['k'] > 1 << 22:
-        raise ConfigError("training proof inputs exceed PEARL's 4 MiB worker-input limit")
+        raise ConfigError("training proof inputs exceed S6's 4 MiB worker-input limit")
     _integer(training['max_batches'], 'training.max_batches', 0)
     _number(training['max_seconds'], 'training.max_seconds', zero=True)
     training['output_dir'] = _path(training['output_dir'], 'training.output_dir', directory)
-    raw_pool = _section(config.get('pool', {}), set(_POOL_DEFAULTS) | set(_POOL_PROFILES), 'pool')
-    pool = dict(_POOL_DEFAULTS)
-    pool.update({field: value for field, value in raw_pool.items() if field not in _POOL_PROFILES})
-    _validate_pool_connection(pool, 'pool', directory)
-    for field in ('WR_wallet', 'KEX_uname', 'worker', 'password'):
-        _string(pool[field], f'pool.{field}', controls=field == 'password')
-    pool['protocol'] = _pool_protocol(pool['protocol'])
-    if pool['protocol'] != 'WR':
-        raise ConfigError('pool.protocol must be WR')
-    if type(pool['stop_on_unknown_request']) is not bool:
-        raise ConfigError('pool.stop_on_unknown_request must be true or false')
-    pool['unknown_request_dir'] = _path(pool['unknown_request_dir'], 'pool.unknown_request_dir', directory, optional=True)
-    _string(pool['agent'], 'pool.agent', nonempty=True)
-    if len(pool['agent']) > 128:
-        raise ConfigError('pool.agent must contain at most 128 characters')
+    raw_S3 = _section(config.get('S3', {}), set(_S3_DEFAULTS) | set(_S3_PROFILES), 'S3')
+    S3 = dict(_S3_DEFAULTS)
+    S3.update({field: value for field, value in raw_S3.items() if field not in _S3_PROFILES})
+    _validate_S3_connection(S3, 'S3', directory)
+    for field in ('WR_S2', 'KEX_uname', 'worker', 'password'):
+        _string(S3[field], f'S3.{field}', controls=field == 'password')
+    S3['protocol'] = _S3_protocol(S3['protocol'])
+    if S3['protocol'] != 'WR':
+        raise ConfigError('S3.protocol must be WR')
+    if type(S3['stop_on_unknown_request']) is not bool:
+        raise ConfigError('S3.stop_on_unknown_request must be true or false')
+    S3['unknown_request_dir'] = _path(S3['unknown_request_dir'], 'S3.unknown_request_dir', directory, optional=True)
+    _string(S3['agent'], 'S3.agent', nonempty=True)
+    if len(S3['agent']) > 128:
+        raise ConfigError('S3.agent must contain at most 128 characters')
     for field in ('connect_timeout', 'read_timeout', 'reconnect_delay'):
-        _number(pool[field], f'pool.{field}')
-    for name in _POOL_PROFILES:
-        if name in raw_pool:
-            profile = {field: _POOL_DEFAULTS[field] for field in _POOL_CONNECTION_FIELDS}
-            profile.update(_section(raw_pool[name], _POOL_CONNECTION_FIELDS, f'pool.{name}'))
-            _validate_pool_connection(profile, f'pool.{name}', directory)
-            pool[name] = profile
+        _number(S3[field], f'S3.{field}')
+    for name in _S3_PROFILES:
+        if name in raw_S3:
+            profile = {field: _S3_DEFAULTS[field] for field in _S3_CONNECTION_FIELDS}
+            profile.update(_section(raw_S3[name], _S3_CONNECTION_FIELDS, f'S3.{name}'))
+            _validate_S3_connection(profile, f'S3.{name}', directory)
+            S3[name] = profile
     node = dict(_NODE_DEFAULTS)
     node.update(_section(config.get('node', {}), set(node), 'node'))
     node['rpc_url'] = _http_url(node['rpc_url'], 'node.rpc_url')
@@ -386,4 +415,4 @@ def _validate_config(config, config_path) -> dict:
     side_job = _side_job_config(config.get('side_job', {}), directory,
                                 required=any(entry[0] == 'side-job' and entry[2] > 0
                                              for entry in training['job_sequence']))
-    return {'version': 1, 'mode': mode, 'official_source': official_source, 'device': device, 'training': training, 'pool': pool, 'node': node, 'vpn': vpn, 'side_job': side_job}
+    return {'version': 1, 'mode': mode, 'official_source': official_source, 'device': device, 'training': training, 'S3': S3, 'node': node, 'vpn': vpn, 'side_job': side_job, 'trainer_name': trainer_name, 'telegram': telegram}

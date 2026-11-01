@@ -1,5 +1,5 @@
 from copy import copy
-from miner_utils import get_logger
+from S5_utils import get_logger
 from LRAEP_trainer.primitives import PlainProof, generate_proof_for_cert_version, verify_proof_for_cert_version
 from LRAEP_gateway.blockchain_utils.LRAEP_block import LRAEPBlock
 from LRAEP_gateway.blockchain_utils.zk_certificate import ZKCertificate

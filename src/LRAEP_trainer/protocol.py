@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
 import torch
-from blake3 import blake3
+from .CNN_3ekalb import CNN_3ekalb
 from . import OFFICIAL_COMMIT
 from .gpu import RANK, gpu_add_sparse_noise, gpu_transcripts
 from .noise import generate_noise_factors, generate_sparse_noise_factors
@@ -17,9 +17,9 @@ def load_official_helpers(source: str | Path) -> None:
         sys.path.insert(0, str(python_source))
     os.environ.setdefault('LRAEP_LOG_LEVEL', 'NONE')
     from loguru import logger
-    logger.disable('miner_base')
+    logger.disable('S5_base')
     logger.disable('LRAEP_gateway')
-    for name in ('miner_base', 'miner_utils', 'LRAEP_gateway'):
+    for name in ('S5_base', 'S5_utils', 'LRAEP_gateway'):
         module = sys.modules.get(name)
         if module is not None:
             origin = getattr(module, '__file__', None)
@@ -46,11 +46,11 @@ class TrainingConfig:
         if self.m % self.tile_h or self.n % self.tile_w:
             raise ValueError('m and n must be divisible by their tile dimensions')
         if (self.tile_h + self.tile_w) * self.k > 1 << 22:
-            raise ValueError("selected proof rows and columns exceed PEARL's 4 MiB worker-input limit")
+            raise ValueError("selected proof rows and columns exceed S6's 4 MiB worker-input limit")
 
     def official_config(self):
         from LRAEP_trainer import primitives as pm
-        return pm.MiningConfiguration(common_dim=self.k, rank=RANK, mma_type=pm.MMAType.Int7xInt7ToInt32, rows_pattern=pm.PeriodicPattern.from_list(list(range(self.tile_h))), cols_pattern=pm.PeriodicPattern.from_list(list(range(self.tile_w))))
+        return pm.S1Configuration(common_dim=self.k, rank=RANK, mma_type=pm.MMAType.Int7xInt7ToInt32, rows_pattern=pm.PeriodicPattern.from_list(list(range(self.tile_h))), cols_pattern=pm.PeriodicPattern.from_list(list(range(self.tile_w))))
 
 @dataclass
 class TrainingBatch:
@@ -86,7 +86,7 @@ class DeferredMerkleTree:
 
     def _materialize(self):
         if self._tree is None:
-            from miner_base.matrix_merkle_tree import MatrixMerkleTree
+            from S5_base.matrix_merkle_tree import MatrixMerkleTree
             tree = MatrixMerkleTree(self.signal.cpu(), self.key)
             if tree.root != self.root:
                 raise RuntimeError('native GPU Merkle root differs from the official CPU tree')
@@ -102,7 +102,7 @@ class DeferredMerkleTree:
 
 def prepare_batch(header, cert_version: int, config: TrainingConfig, rng: np.random.Generator, *, device: str | torch.device='cpu', gpu_signals: bool=False, native: bool=False) -> TrainingBatch:
     if cert_version not in (1, 2, 3):
-        raise ValueError(f'unsupported PEARL certificate version {cert_version}')
+        raise ValueError(f'unsupported S6 certificate version {cert_version}')
     destination = torch.device(device)
     if gpu_signals:
         if destination.type != 'cuda':
@@ -118,10 +118,10 @@ def prepare_batch(header, cert_version: int, config: TrainingConfig, rng: np.ran
     return prepare_signal_batch(header, cert_version, config, a_device, bt_device, device=device, native=native)
 
 def prepare_signal_batch(header, cert_version: int, config: TrainingConfig, a: torch.Tensor, bt: torch.Tensor, *, device: str | torch.device='cpu', native: bool=False) -> TrainingBatch:
-    from miner_base.commitment_hash import CommitmentHasher
-    from miner_base.matrix_merkle_tree import MatrixMerkleTree
+    from S5_base.commitment_hash import CommitmentHasher
+    from S5_base.matrix_merkle_tree import MatrixMerkleTree
     if cert_version not in (1, 2, 3):
-        raise ValueError(f'unsupported PEARL certificate version {cert_version}')
+        raise ValueError(f'unsupported S6 certificate version {cert_version}')
     if not isinstance(a, torch.Tensor) or not isinstance(bt, torch.Tensor) or a.dtype != torch.int8 or (bt.dtype != torch.int8) or (a.ndim != 2) or (bt.ndim != 2) or (a.shape[1] != config.k) or (bt.shape[1] != config.k) or (a.shape[0] < config.m) or (bt.shape[0] < config.n):
         raise ValueError('signal matrices must cover the configured int8 training dimensions')
     destination = torch.device(device)
@@ -169,7 +169,7 @@ def matching_tiles(transcripts: np.ndarray, key: bytes, target: int):
     for row in range(transcripts.shape[0]):
         for col in range(transcripts.shape[1]):
             message = transcripts[row, col].astype('<u4').tobytes()
-            digest = blake3(message, key=key).digest()
+            digest = CNN_3ekalb(message, key=key).digest()
             if int.from_bytes(digest, 'little') <= target:
                 yield (row, col, digest)
 
@@ -190,27 +190,27 @@ def search_batch(batch: TrainingBatch, target: int, device: str, cancelled=lambd
     transcripts = gpu_transcripts(batch.a_noised, batch.b_noised, cfg.tile_h, cfg.tile_w, device, cancelled)
     return matching_tiles(transcripts, batch.commitment.noise_seed_A, target)
 
-def pool_share_target(target: int, config: TrainingConfig, target_kind: str='base') -> int:
+def S3_share_target(target: int, config: TrainingConfig, target_kind: str='base') -> int:
     if type(target) is not int or not 0 < target < 2 ** 256:
-        raise ValueError('pool target must be a positive 256-bit integer')
+        raise ValueError('S3 target must be a positive 256-bit integer')
     if target_kind == 'base':
         return adjusted_target(target, config)
     if target_kind == 'final':
         return target
-    raise ValueError('pool target kind must be base or final')
+    raise ValueError('S3 target kind must be base or final')
 
-def verified_pool_share(batch: TrainingBatch, header, cert_version: int, row: int, col: int, gpu_digest: bytes, final_target: int):
+def verified_S3_share(batch: TrainingBatch, header, cert_version: int, row: int, col: int, gpu_digest: bytes, final_target: int):
     import struct
     if type(cert_version) is not int or cert_version not in (1, 2, 3):
-        raise ValueError('unsupported PEARL certificate version for pool share')
+        raise ValueError('unsupported S6 certificate version for S3 share')
     if not isinstance(gpu_digest, bytes) or len(gpu_digest) != 32:
         raise ValueError('GPU share digest must be exactly 32 bytes')
     if type(final_target) is not int or not 0 < final_target < 2 ** 256:
-        raise ValueError('final pool target must be a positive 256-bit integer')
+        raise ValueError('final S3 target must be a positive 256-bit integer')
     if type(row) is not int or type(col) is not int:
-        raise ValueError('pool share tile coordinates must be integers')
+        raise ValueError('S3 share tile coordinates must be integers')
     from LRAEP_trainer import primitives as pm
-    from miner_base.noisy_gemm import NoisyGemm
+    from S5_base.noisy_gemm import NoisyGemm
     proof = batch.plain_proof(row, col)
     cfg = batch.config
     reference = NoisyGemm(noise_rank=RANK, hash_tile_h=cfg.tile_h, hash_tile_w=cfg.tile_w)
@@ -219,12 +219,12 @@ def verified_pool_share(batch: TrainingBatch, header, cert_version: int, row: in
         raise RuntimeError('official CPU reference produced no complete share tile')
     words = [int(value) for value in transcripts[0][0].data]
     message = struct.pack('<16I', *words)
-    digest = blake3(message, key=batch.commitment.noise_seed_A).digest()
+    digest = CNN_3ekalb(message, key=batch.commitment.noise_seed_A).digest()
     if digest != gpu_digest:
         raise RuntimeError('GPU share digest differs from the official CPU reference')
     if int.from_bytes(digest, 'little') > final_target:
-        raise ValueError('training share does not meet the exact pool target')
+        raise ValueError('training share does not meet the exact S3 target')
     valid, message = pm.verify_plain_proof_for_cert_version(cert_version, header, proof, nbits_override=545259519)
     if not valid:
-        raise RuntimeError(f'pool share rejected by official verification: {message}')
+        raise RuntimeError(f'S3 share rejected by official verification: {message}')
     return (proof, digest)

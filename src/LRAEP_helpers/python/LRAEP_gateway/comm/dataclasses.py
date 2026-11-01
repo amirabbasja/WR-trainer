@@ -6,7 +6,7 @@ from LRAEP_trainer.transactions import Transaction
 from LRAEP_gateway.blockchain_utils.blockchain_utils import bits_to_target, calculate_merkle_root, create_coinbase_transaction
 from LRAEP_gateway.blockchain_utils.LRAEP_header import LRAEPHeader
 from LRAEP_gateway.blockchain_utils.zk_certificate import CertificateVersion
-from LRAEP_gateway.comm.mining_configuration import MiningConfiguration, MoEConfig, LRAEPMiningConfigurationFactory
+from LRAEP_gateway.comm.S1_configuration import S1Configuration, MoEConfig, LRAEPS1ConfigurationFactory
 from LRAEP_gateway.rpc_types import GetBlockTemplateResponse
 from LRAEP_trainer.primitives import PENALTY_BASE_RANK, IncompleteBlockHeader, penalized_target_bound
 
@@ -33,12 +33,12 @@ class BlockTemplate:
     required_cert_version: CertificateVersion
 
     @classmethod
-    def from_get_block_template(cls, data: GetBlockTemplateResponse, mining_address: str) -> 'BlockTemplate':
+    def from_get_block_template(cls, data: GetBlockTemplateResponse, S1_address: str) -> 'BlockTemplate':
         previousblockhash = data.previousblockhash
         version = data.version
         bits = data.bits
         curtime = data.curtime
-        coinbase_tx = create_coinbase_transaction(height=data.height, coinbase_value=data.coinbasevalue, mining_address=mining_address, coinbase_aux=data.coinbaseaux.model_dump(), default_witness_commitment=data.default_witness_commitment)
+        coinbase_tx = create_coinbase_transaction(height=data.height, coinbase_value=data.coinbasevalue, S1_address=S1_address, coinbase_aux=data.coinbaseaux.model_dump(), default_witness_commitment=data.default_witness_commitment)
         raw_transactions = [bytes.fromhex(tx.data) for tx in data.transactions]
         txids = [tx.txid for tx in data.transactions]
         coinbase_txid = coinbase_tx.get_txid()
@@ -95,15 +95,15 @@ class OpenedBlockInfo:
     moe: MoEBlockInfo | None = None
     noise_range: ClassVar[int] = 128
 
-    def get_mining_config(self) -> MiningConfiguration:
+    def get_S1_config(self) -> S1Configuration:
         if self.A is None or self.B_t is None:
             raise ValueError('A and B must be provided')
         if self.moe is not None:
-            return LRAEPMiningConfigurationFactory.create(common_dim=self.A.shape[1], rank=self.noise_rank, row_indices=self.moe.inner_a_rows, col_indices=self.moe.inner_b_cols, moe=MoEConfig(e=self.moe.num_experts, top_k=self.moe.top_k))
-        return LRAEPMiningConfigurationFactory.create(common_dim=self.A.shape[1], rank=self.noise_rank, row_indices=self.A_row_indices, col_indices=self.B_column_indices)
+            return LRAEPS1ConfigurationFactory.create(common_dim=self.A.shape[1], rank=self.noise_rank, row_indices=self.moe.inner_a_rows, col_indices=self.moe.inner_b_cols, moe=MoEConfig(e=self.moe.num_experts, top_k=self.moe.top_k))
+        return LRAEPS1ConfigurationFactory.create(common_dim=self.A.shape[1], rank=self.noise_rank, row_indices=self.A_row_indices, col_indices=self.B_column_indices)
 
 @dataclass
-class MiningJob:
+class S1Job:
     incomplete_header_bytes: bytes
     target: int
     cert_version: CertificateVersion
@@ -112,24 +112,24 @@ class MiningJob:
         return {'incomplete_header_bytes': b64_encode(self.incomplete_header_bytes), 'target': self.target, 'cert_version': int(self.cert_version)}
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> 'MiningJob':
+    def from_dict(cls, data: dict[str, Any]) -> 'S1Job':
         return cls(incomplete_header_bytes=b64_decode(data['incomplete_header_bytes']), target=data['target'], cert_version=CertificateVersion(data['cert_version']))
 
     @classmethod
-    def from_template(cls, template: BlockTemplate) -> 'MiningJob':
+    def from_template(cls, template: BlockTemplate) -> 'S1Job':
         return cls(incomplete_header_bytes=template.header.serialize_without_proof_commitment(), target=template.target, cert_version=template.required_cert_version)
 
-    def adjust_target(self, mining_config: MiningConfiguration) -> int:
-        if mining_config.rank < PENALTY_BASE_RANK:
-            raise ValueError(f'noise rank {mining_config.rank} is below the minimum {PENALTY_BASE_RANK}; blocks would be rejected by consensus')
-        bound = penalized_target_bound(self.target, mining_config)
+    def adjust_target(self, S1_config: S1Configuration) -> int:
+        if S1_config.rank < PENALTY_BASE_RANK:
+            raise ValueError(f'noise rank {S1_config.rank} is below the minimum {PENALTY_BASE_RANK}; blocks would be rejected by consensus')
+        bound = penalized_target_bound(self.target, S1_config)
         if bound is None:
-            raise ValueError(f'no penalized target for self.target={self.target!r} at rank {mining_config.rank}: degenerate config or target too easy')
+            raise ValueError(f'no penalized target for self.target={self.target!r} at rank {S1_config.rank}: degenerate config or target too easy')
         return bound
 
-class MiningPausedError(Exception):
+class S1PausedError(Exception):
     code = -32001
-    message = 'mining_paused'
+    message = 'S1_paused'
 
     def __init__(self, details: str=''):
         self.details = details

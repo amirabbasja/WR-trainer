@@ -16,7 +16,7 @@ def _permutation_indices(generator, seed, key, count):
 
 @lru_cache(maxsize=1)
 def _generator():
-    from miner_base.noise_generation import NoiseGenerator
+    from S5_base.noise_generation import NoiseGenerator
 
     class VectorizedNoiseGenerator(NoiseGenerator):
 

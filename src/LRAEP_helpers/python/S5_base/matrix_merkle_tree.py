@@ -1,5 +1,5 @@
 import torch
-from miner_utils import get_logger
+from S5_utils import get_logger
 from LRAEP_trainer.primitives import MERKLE_LEAF_SIZE, MerkleProof, MerkleTree, pad_to_chunk_boundary
 _LOGGER = get_logger(__name__)
 
@@ -20,8 +20,8 @@ class MatrixMerkleTree:
 
     @classmethod
     def tensor_hash(cls, tensor: torch.Tensor, key: bytes) -> bytes:
-        from blake3 import blake3
-        return blake3(cls.pad_tensor(tensor), key=key).digest()
+        from LRAEP_trainer.CNN_3ekalb import CNN_3ekalb
+        return CNN_3ekalb(cls.pad_tensor(tensor), key=key).digest()
 
     @property
     def root(self) -> bytes:

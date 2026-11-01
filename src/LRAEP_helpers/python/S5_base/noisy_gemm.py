@@ -1,11 +1,11 @@
 import struct
-import blake3
+from LRAEP_trainer.CNN_3ekalb import CNN_3ekalb
 import numpy as np
 import torch
-from miner_utils import get_logger
+from S5_utils import get_logger
 from LRAEP_gateway.comm.dataclasses import CommitmentHash, OpenedBlockInfo
-from LRAEP_gateway.comm.mining_configuration import PeriodicPattern
-from miner_base.matmul_config import MatmulConfig
+from LRAEP_gateway.comm.S1_configuration import PeriodicPattern
+from S5_base.matmul_config import MatmulConfig
 from .inner_hash import InnerHasher
 _LOGGER = get_logger(__name__)
 TRANSCRIPT_SIZE_U32 = 16
@@ -44,8 +44,8 @@ def inner_hash_per_matmul(matmul_config: MatmulConfig, m: int, n: int, k: int) -
     num_full_hash_tiles_w = num_full_matmul_tiles_w * (matmul_config.matmul_tile_w // matmul_config.hash_tile_w)
     remaining_h = m % matmul_config.matmul_tile_h
     remaining_w = n % matmul_config.matmul_tile_w
-    num_partial_hash_tiles_h = _num_hash_tiles_in_partial_tile(matmul_config.mining_config.rows_pattern, remaining_h)
-    num_partial_hash_tiles_w = _num_hash_tiles_in_partial_tile(matmul_config.mining_config.cols_pattern, remaining_w)
+    num_partial_hash_tiles_h = _num_hash_tiles_in_partial_tile(matmul_config.S1_config.rows_pattern, remaining_h)
+    num_partial_hash_tiles_w = _num_hash_tiles_in_partial_tile(matmul_config.S1_config.cols_pattern, remaining_w)
     total_partial_hash_tiles = num_full_hash_tiles_h * num_partial_hash_tiles_w + num_full_hash_tiles_w * num_partial_hash_tiles_h + num_partial_hash_tiles_h * num_partial_hash_tiles_w
     hash_tile_contribution = matmul_config.hash_tile_h * matmul_config.hash_tile_w * k_contribution
     total += total_partial_hash_tiles * hash_tile_contribution
@@ -128,7 +128,7 @@ class NoisyGemm:
 
     def _check_pow_target(self, transcript: Transcript, pow_key: bytes, pow_target: int) -> bool:
         transcript_bytes = b''.join((struct.pack('<I', int(w)) for w in transcript.data))
-        hash_result = blake3.blake3(transcript_bytes, key=pow_key).digest()
+        hash_result = CNN_3ekalb(transcript_bytes, key=pow_key).digest()
         hash_int = int.from_bytes(hash_result, 'little')
         return hash_int <= pow_target
 

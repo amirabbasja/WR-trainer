@@ -1,8 +1,8 @@
 from math import ceil
 import numpy as np
 import torch
-from blake3 import blake3
-from miner_utils import get_logger
+from LRAEP_trainer.CNN_3ekalb import CNN_3ekalb
+from S5_utils import get_logger
 logger = get_logger(__name__)
 
 def is_power_of_two(n: int) -> bool:
@@ -26,8 +26,8 @@ class NoiseGenerator:
             raise ValueError('noise_rank must be a power of two')
         if noise_range > 128:
             raise ValueError('noise_range must fit in uint7')
-        if noise_rank % blake3.digest_size != 0:
-            raise ValueError(f'noise_rank must be divisible by blake3.digest_size={blake3.digest_size!r}')
+        if noise_rank % CNN_3ekalb.digest_size != 0:
+            raise ValueError(f'noise_rank must be divisible by blake3.digest_size={CNN_3ekalb.digest_size!r}')
         logger.info(f'Initialized NoiseGenerator with noise_rank={noise_rank}, noise_range={noise_range}')
         idxs_per_col = 2
         _noise_range = noise_range // idxs_per_col
@@ -54,14 +54,14 @@ class NoiseGenerator:
         message_prepend = np.zeros(8, dtype=np.int32)
         message_prepend[prepend_index] = 1 + index
         message_bytes = message_prepend.tobytes() + seed
-        return blake3(message_bytes, key=key).digest()
+        return CNN_3ekalb(message_bytes, key=key).digest()
 
     def __generate_uniform_random_matrix(self, seed: bytes, key: bytes, rows: int) -> torch.Tensor:
         cols = self.noise_rank
         assert len(seed) == 32, 'seed must be 32 bytes'
         assert len(key) == 32, 'key must be 32 bytes'
         noise_matrix = torch.zeros(rows, cols, dtype=torch.int8)
-        draws = int(ceil(rows * cols / blake3.digest_size))
+        draws = int(ceil(rows * cols / CNN_3ekalb.digest_size))
         random_bytes = b''.join((self.__get_random_hash(i, seed, key, 0) for i in range(draws)))
         random_tensor = torch.frombuffer(bytearray(random_bytes), dtype=torch.uint8)[:rows * cols]
         noise_matrix = ((random_tensor & self.range_mask) - self.zero_point_translation).to(torch.int8).view(rows, cols)
@@ -79,18 +79,18 @@ class NoiseGenerator:
             required_lines = rows
             assert cols == self.noise_rank, 'cols must be equal to noise_rank'
         bytes_per_lines = 4
-        draws = int(ceil(required_lines * bytes_per_lines / blake3.digest_size))
+        draws = int(ceil(required_lines * bytes_per_lines / CNN_3ekalb.digest_size))
         for i in range(draws):
             random_hash = self.__get_random_hash(i, seed, key, 1)
             random_uint32_array = np.frombuffer(random_hash, dtype=np.uint32)
-            for k in range(blake3.digest_size // bytes_per_lines):
+            for k in range(CNN_3ekalb.digest_size // bytes_per_lines):
                 random_uint32 = random_uint32_array[k]
                 first_idx = random_uint32 & self.rank_mask
                 second_idx = first_idx ^ 1 + np_mul_hi_u32(np.uint32(self.noise_rank - 1), random_uint32)
                 permutation = torch.zeros(self.noise_rank, dtype=torch.int8)
                 permutation[first_idx] = 1
                 permutation[second_idx] = -1
-                assignment_index = i * blake3.digest_size // bytes_per_lines + k
+                assignment_index = i * CNN_3ekalb.digest_size // bytes_per_lines + k
                 if assignment_index >= required_lines:
                     break
                 if assign_columns:

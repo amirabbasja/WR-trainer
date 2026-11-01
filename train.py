@@ -148,23 +148,23 @@ def run(root=None, *, login_only=False):
     os.environ.setdefault('LRAEP_DATA_DIR', str(root / '.runtime'))
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', stream=sys.stdout, force=True)
     try:
-        from LRAEP_trainer.config import load_config, resolve_pool_settings
+        from LRAEP_trainer.config import load_config, resolve_S3_settings
         from LRAEP_trainer.network import routed
-        from LRAEP_trainer.pool_training import run_pool_training, validate_pool_endpoint, validate_pool_identity
+        from LRAEP_trainer.S3_training import run_S3_training, validate_S3_endpoint, validate_S3_identity
         from LRAEP_trainer.vpn import ManagedVPN
         config = load_config(root / 'config.json')
         if not login_only and config['training']['job_sequence'][0][2] == -1:
             return 0
-        config['pool'] = resolve_pool_settings(config['pool'])
-        if config['pool']['protocol'] != 'WR':
+        config['S3'] = resolve_S3_settings(config['S3'])
+        if config['S3']['protocol'] != 'WR':
             raise ValueError('WR is required')
         if not config['vpn']['enabled'] or not config['vpn']['link']:
             raise ValueError('An enabled VPN link is required')
-        validate_pool_endpoint(config['pool'])
-        validate_pool_identity(config['pool'], validate_address=False)
+        validate_S3_endpoint(config['S3'])
+        validate_S3_identity(config['S3'], validate_address=False)
         with ManagedVPN(config['vpn']) as proxy, routed(proxy):
             print('WR training | VPN enabled', flush=True)
-            return run_pool_training(config, login_only=login_only)
+            return run_S3_training(config, login_only=login_only)
     except KeyboardInterrupt:
         print('Stopped', flush=True)
         return 130

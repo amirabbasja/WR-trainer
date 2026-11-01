@@ -34,8 +34,8 @@ def bits_to_target(bits: int) -> int:
     target = mantissa << (8 * (exponent - 3)) if exponent >= 3 else mantissa >> (8 * (3 - exponent))
     return target
 
-def create_coinbase_transaction(height: int, coinbase_value: int, mining_address: str, coinbase_aux: dict[str, str] | None=None, default_witness_commitment: str | None=None) -> Transaction:
-    script_pubkey = get_script_pubkey_from_p2tr_address(mining_address)
+def create_coinbase_transaction(height: int, coinbase_value: int, S1_address: str, coinbase_aux: dict[str, str] | None=None, default_witness_commitment: str | None=None) -> Transaction:
+    script_pubkey = get_script_pubkey_from_p2tr_address(S1_address)
     height_script = Script([height])
     coinbase_script_bytes = bytes.fromhex(height_script.to_hex())
     coinbase_script_bytes += b'\x00'

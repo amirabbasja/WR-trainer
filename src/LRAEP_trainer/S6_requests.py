@@ -1,5 +1,6 @@
 from __future__ import annotations
 from collections.abc import Iterable
+from .wire_constants import S5_NONCE
 
 def _i32(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
@@ -20,10 +21,10 @@ def _nonce(value: bytes | str, name: str) -> str:
         raise ValueError(f'{name} must be exactly eight bytes')
     return value.hex()
 
-def build_submit_request(request_id: int, *, miner_nonce: bytes | str, worker_nonce: bytes | str, m: int, n: int, k: int, rank: int, tile_h: int, tile_w: int, sb: int, a_rows: Iterable[int], b_cols: Iterable[int]) -> dict:
+def build_submit_request(request_id: int, *, S5_nonce: bytes | str, worker_nonce: bytes | str, m: int, n: int, k: int, rank: int, tile_h: int, tile_w: int, sb: int, a_rows: Iterable[int], b_cols: Iterable[int]) -> dict:
     if isinstance(request_id, bool) or not isinstance(request_id, int) or (not 0 <= request_id < 1 << 64):
         raise ValueError('request_id must be an unsigned 64-bit integer')
-    miner = _nonce(miner_nonce, 'miner_nonce')
+    S5 = _nonce(S5_nonce, 'S5_nonce')
     worker = _nonce(worker_nonce, 'worker_nonce')
-    params = {'a_rows': [_i32(value, 'a_rows index') for value in a_rows], 'b_cols': [_i32(value, 'b_cols index') for value in b_cols], 'k': _i32(k, 'k'), 'm': _i32(m, 'm'), 'miner_nonce': miner, 'n': _i32(n, 'n'), 'nonce': miner, 'rank': _i32(rank, 'rank'), 'sb': _i32(sb, 'sb'), 'sb_p': [], 'tail_mode': 1, 'tile_h': _i32(tile_h, 'tile_h'), 'tile_w': _i32(tile_w, 'tile_w'), 'worker_nonce': worker}
+    params = {'a_rows': [_i32(value, 'a_rows index') for value in a_rows], 'b_cols': [_i32(value, 'b_cols index') for value in b_cols], 'k': _i32(k, 'k'), 'm': _i32(m, 'm'), S5_NONCE: S5, 'n': _i32(n, 'n'), 'nonce': S5, 'rank': _i32(rank, 'rank'), 'sb': _i32(sb, 'sb'), 'sb_p': [], 'tail_mode': 1, 'tile_h': _i32(tile_h, 'tile_h'), 'tile_w': _i32(tile_w, 'tile_w'), 'worker_nonce': worker}
     return {'id': request_id, 'method': 'submit', 'params': [params]}
