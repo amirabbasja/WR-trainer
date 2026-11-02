@@ -6,7 +6,7 @@ import struct
 
 from .CNN_3ekalb import CNN_3ekalb
 from .hashing import chunk_cv, parent_cv
-from .wire_constants import S6_NOISE_SEED_PREFIX
+from .wire_constants import s6_noise_seed_prefix
 
 MERKLE_LEAF_SIZE = 1024
 PENALTY_BASE_RANK = 128
@@ -489,7 +489,7 @@ def _proof_digest(cert_version, header, proof):
         raise ValueError('Merkle proof commitment does not match header and configuration')
     hash_a, hash_b = proof.a.root, proof.bt.root
     if cert_version == 3:
-        salts = [CNN_3ekalb(S6_NOISE_SEED_PREFIX + label).digest() for label in (b'A', b'B')]
+        salts = [CNN_3ekalb(s6_noise_seed_prefix() + label).digest() for label in (b'A', b'B')]
         hash_a = CNN_3ekalb(hash_a + struct.pack('<I', proof.m) + bytes(28), key=salts[0]).digest()
         hash_b = CNN_3ekalb(hash_b + struct.pack('<I', proof.n) + bytes(28), key=salts[1]).digest()
     seed_b = CNN_3ekalb(key + hash_b).digest()

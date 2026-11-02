@@ -7,8 +7,14 @@ from typing import Any
 from .S6_requests import build_submit_request
 from .S3_protocol import DEFAULT_AGENT, S3Job, S3ProtocolError, _text
 _HEX = re.compile('[0-9a-fA-F]+\\Z')
-HEADER_MASK = bytes.fromhex('9d2f73c411a85be0367ad14e920cbf65f32884da176eb941cc530fa67de21974')
-WORK_PREFIX_MASK = bytes.fromhex('4dc0d47dff723cf8f75a583b596cf848f5106dd0d0aa7bdded9d4d566a929ffaabea8985cf34a26af1b118e2c697f283f0caadd643b0975390a17c79aae32e69cf166b57a6f64dd02914e7e4')
+
+
+def header_mask():
+    return bytes.fromhex('9d2f73c411a85be0367ad14e920cbf65f32884da176eb941cc530fa67de21974')
+
+
+def work_prefix_mask():
+    return bytes.fromhex('4dc0d47dff723cf8f75a583b596cf848f5106dd0d0aa7bdded9d4d566a929ffaabea8985cf34a26af1b118e2c697f283f0caadd643b0975390a17c79aae32e69cf166b57a6f64dd02914e7e4')
 
 class UnknownWRRequest(S3ProtocolError):
     pass
@@ -20,7 +26,9 @@ def _hex_bytes(value: Any, length: int, label: str) -> bytes:
 
 def decode_notify_payload(value: str) -> bytes:
     payload = _hex_bytes(value, 200, 'notify payload')
-    header = bytes((byte ^ WORK_PREFIX_MASK[index] ^ HEADER_MASK[index % 32] for index, byte in enumerate(payload[:76])))
+    prefix = work_prefix_mask()
+    mask = header_mask()
+    header = bytes((byte ^ prefix[index] ^ mask[index % 32] for index, byte in enumerate(payload[:76])))
     nbits = int.from_bytes(header[72:76], 'little')
     exponent, mantissa = (nbits >> 24, nbits & 8388607)
     target = mantissa >> 8 * (3 - exponent) if exponent <= 3 else mantissa << 8 * (exponent - 3)

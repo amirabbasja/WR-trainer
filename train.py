@@ -89,11 +89,6 @@ def start(root=None, *, login_only=False, output=None):
                                     start_new_session=os.name == 'posix')
         _last_returncode = None
         stream = sys.stdout if output is None else output
-        try:
-            stream.write(f'Training started (PID {_process.pid}). Call trainer.stop_training() to stop and release GPU memory.\n')
-            stream.flush()
-        except (OSError, ValueError):
-            stream = None
         on_exit = getattr(output, 'finish', None)
         _output_thread = threading.Thread(target=_watch_worker, args=(_process, stream, on_exit),
                                           name='WR-training-monitor', daemon=True)
@@ -133,7 +128,6 @@ def stop_training(timeout=10):
         code = process.returncode
         _last_returncode = code
         _process, _output_thread = None, None
-        print(f'Training stopped (exit code {code}); worker GPU memory released.', flush=True)
         return code
 
 
@@ -146,7 +140,7 @@ def run(root=None, *, login_only=False):
     sys.path.insert(0, str(root / 'src'))
     os.environ.setdefault('LRAEP_CACHE_DIR', str(root / '.runtime/cache'))
     os.environ.setdefault('LRAEP_DATA_DIR', str(root / '.runtime'))
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', stream=sys.stdout, force=True)
+    logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(message)s', stream=sys.stdout, force=True)
     try:
         from LRAEP_trainer.config import load_config, resolve_S3_settings
         from LRAEP_trainer.network import routed
@@ -163,7 +157,6 @@ def run(root=None, *, login_only=False):
         validate_S3_endpoint(config['S3'])
         validate_S3_identity(config['S3'], validate_address=False)
         with ManagedVPN(config['vpn']) as proxy, routed(proxy):
-            print('WR training | VPN enabled', flush=True)
             return run_S3_training(config, login_only=login_only)
     except KeyboardInterrupt:
         print('Stopped', flush=True)

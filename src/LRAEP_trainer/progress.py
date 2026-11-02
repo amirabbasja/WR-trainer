@@ -23,6 +23,27 @@ def _fit_columns(text: str, columns: int) -> str:
         used += width
     return ''.join(result)
 
+
+def job_status(job_number, job_title, gpu_percent, time_remaining, speed):
+    title = "side" if job_title == "side-job" else job_title
+    if title not in {"main", "side"}:
+        raise ValueError("job title must be main or side")
+    utilization = "N/A" if gpu_percent is None else f"{gpu_percent}%"
+    if time_remaining is None or not math.isfinite(time_remaining):
+        remaining = "--:--:--"
+    else:
+        hours, remainder = divmod(int(max(0, time_remaining)), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        remaining = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    if speed is None or not math.isfinite(speed):
+        value = "0"
+    elif isinstance(speed, int):
+        value = str(speed)
+    else:
+        value = f"{speed:.2f}".rstrip("0").rstrip(".")
+    return f"{job_number} | {title} | {utilization} | {remaining} | {value}"
+
+
 class LiveProgress:
 
     def __init__(self, stream=None, interval: float=1.0):

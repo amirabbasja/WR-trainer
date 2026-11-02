@@ -5,7 +5,10 @@ import numpy as np
 import torch
 from .protocol import TrainingConfig, prepare_signal_batch
 from .wr_protocol import WRJob, WRShare
-SIGNAL_BASE = 64
+
+
+def signal_base():
+    return int('40', 16)
 
 def wr_nonce_tail(S5_nonce: bytes, worker_nonce: bytes) -> bytes:
     if any((not isinstance(value, bytes) or len(value) != 8 for value in (S5_nonce, worker_nonce))):
@@ -20,8 +23,8 @@ def prepare_wr_batch(job: WRJob, config: TrainingConfig, rng: np.random.Generato
     S5_nonce = rng.bytes(8)
     tail = wr_nonce_tail(S5_nonce, job.worker_nonce)
     destination = torch.device(device)
-    a = torch.full((config.m + 1, config.k), SIGNAL_BASE, dtype=torch.int8, device=destination)
-    bt = torch.full((config.n, config.k), SIGNAL_BASE, dtype=torch.int8, device=destination)
+    a = torch.full((config.m + 1, config.k), signal_base(), dtype=torch.int8, device=destination)
+    bt = torch.full((config.n, config.k), signal_base(), dtype=torch.int8, device=destination)
     a[-1, -16:] = torch.from_numpy(np.frombuffer(tail, dtype=np.int8).copy()).to(destination)
     from LRAEP_trainer import primitives as pm
     header = pm.IncompleteBlockHeader.from_bytes(job.header_bytes)
@@ -47,7 +50,7 @@ def _validate_share(share: WRShare) -> None:
 
 def _constant_root(length: int, key: bytes, tail=b'') -> bytes:
     hasher = CNN_3ekalb(key=key)
-    block = bytes([SIGNAL_BASE]) * min(length, 1 << 20)
+    block = bytes([signal_base()]) * min(length, 1 << 20)
     remaining = length - len(tail)
     while remaining:
         size = min(remaining, len(block))
@@ -85,8 +88,8 @@ def reconstruct_wr_digest(header_bytes: bytes, share: WRShare) -> bytes:
     br = _uniform_rows(share.b_cols, b_label, commitment.noise_seed_B)
     ai, aj = _permutation(share.k, a_label, commitment.noise_seed_A)
     bi, bj = _permutation(share.k, b_label, commitment.noise_seed_B)
-    a = torch.from_numpy((SIGNAL_BASE + al[:, ai] - al[:, aj]).astype(np.int8))
-    b = torch.from_numpy((SIGNAL_BASE + br[:, bi] - br[:, bj]).astype(np.int8).T.copy())
+    a = torch.from_numpy((signal_base() + al[:, ai] - al[:, aj]).astype(np.int8))
+    b = torch.from_numpy((signal_base() + br[:, bi] - br[:, bj]).astype(np.int8).T.copy())
     reference = NoisyGemm(noise_rank=128, hash_tile_h=share.tile_h, hash_tile_w=share.tile_w)
     _, complete, transcripts = reference._process_output_tile(a, b, share.k, 0, share.tile_h, 0, share.tile_w)
     if not complete:

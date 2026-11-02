@@ -6,8 +6,14 @@ from dataclasses import dataclass
 import gzip
 import re
 from typing import Any
-S1 = base64.b64decode('bWluaW5nLg==').decode('ascii')
-S2 = base64.b64decode('d2FsbGV0').decode('ascii')
+
+
+def s1():
+    return base64.b64decode('bWluaW5nLg==').decode('ascii')
+
+
+def s2():
+    return base64.b64decode('d2FsbGV0').decode('ascii')
 DEFAULT_AGENT = 'LRAEP-trainer/0.1'
 MAX_DECODED_PROOF_BYTES = 4 * 1024 * 1024
 _HEX = re.compile('[0-9a-fA-F]+\\Z')
@@ -87,8 +93,8 @@ class KEXDialect:
     def auth_requests(self, start_id: int=1) -> list[dict[str, Any]]:
         _integer(start_id, 'request ID', 1)
         if self.request_gzip:
-            return [{'jsonrpc': '2.0', 'id': start_id, 'method': S1 + 'authorize', 'params': {S2: self.login, 'agent': self.agent, 'password': self.password, 'type': 'v2'}}]
-        return [{'jsonrpc': '2.0', 'id': start_id, 'method': S1 + 'subscribe', 'params': [self.agent]}, {'jsonrpc': '2.0', 'id': start_id + 1, 'method': S1 + 'authorize', 'params': [self.login, self.password]}]
+            return [{'jsonrpc': '2.0', 'id': start_id, 'method': s1() + 'authorize', 'params': {s2(): self.login, 'agent': self.agent, 'password': self.password, 'type': 'v2'}}]
+        return [{'jsonrpc': '2.0', 'id': start_id, 'method': s1() + 'subscribe', 'params': [self.agent]}, {'jsonrpc': '2.0', 'id': start_id + 1, 'method': s1() + 'authorize', 'params': [self.login, self.password]}]
 
     @staticmethod
     def accept(response: Mapping[str, Any]) -> bool:
@@ -101,7 +107,7 @@ class KEXDialect:
 
     def parse_job(self, params: Mapping[str, Any], configured_certificate_version: int | None=None) -> S3Job:
         if not isinstance(params, Mapping):
-            raise S3ProtocolError(f'{S1}notify params must be an object')
+            raise S3ProtocolError(f'{s1()}notify params must be an object')
         if configured_certificate_version is not None:
             _certificate(configured_certificate_version)
         job_id = _text(params.get('job_id'), 'job_id', 128)
@@ -130,4 +136,4 @@ class KEXDialect:
         encoded = plain_proof_b64
         if negotiated_gzip:
             encoded = base64.b64encode(gzip.compress(raw, mtime=0)).decode('ascii')
-        return {'jsonrpc': '2.0', 'id': request_id, 'method': S1 + 'submit', 'params': {'worker': self.login, 'job_id': job.job_id, 'plain_proof': encoded}}
+        return {'jsonrpc': '2.0', 'id': request_id, 'method': s1() + 'submit', 'params': {'worker': self.login, 'job_id': job.job_id, 'plain_proof': encoded}}

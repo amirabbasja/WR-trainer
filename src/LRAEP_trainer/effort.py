@@ -96,6 +96,21 @@ class JobSequence:
     def current_job(self):
         return self._current(time.monotonic())
 
+    def position(self, now=None):
+        now = time.monotonic() if now is None else now
+        kind, percentage, until = self._current(now)
+        if percentage == -1:
+            index = next(i for i, entry in enumerate(self.entries) if entry[2] == -1)
+            return index + 1, kind, percentage, until
+        elapsed = max(0, now - self.started)
+        cycle = int(elapsed // self._total)
+        boundary = self.started + cycle * self._total
+        for index, entry in enumerate(self.entries):
+            boundary += entry[1]
+            if now < boundary:
+                return cycle * len(self.entries) + index + 1, kind, percentage, until
+        return (cycle + 1) * len(self.entries) + 1, kind, percentage, until
+
     def ended(self):
         return self.current()[0] == -1
 
@@ -168,7 +183,7 @@ class ScheduledSideJob:
         if self._previous_interval != (percentage, boundary):
             if self.before_log is not None:
                 self.before_log()
-            logging.getLogger('LRAEP_trainer').info('Side-job effort GPU duty-cycle target: %d%%', percentage)
+            logging.getLogger('LRAEP_trainer').debug('Side-job effort GPU duty-cycle target: %d%%', percentage)
             self._previous_interval = (percentage, boundary)
         if self.exhausted:
             if self.on_progress is not None:

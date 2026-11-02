@@ -1,6 +1,6 @@
 from __future__ import annotations
 from collections.abc import Iterable
-from .wire_constants import S5_NONCE
+from .wire_constants import s5_nonce
 
 def _i32(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
@@ -26,5 +26,5 @@ def build_submit_request(request_id: int, *, S5_nonce: bytes | str, worker_nonce
         raise ValueError('request_id must be an unsigned 64-bit integer')
     S5 = _nonce(S5_nonce, 'S5_nonce')
     worker = _nonce(worker_nonce, 'worker_nonce')
-    params = {'a_rows': [_i32(value, 'a_rows index') for value in a_rows], 'b_cols': [_i32(value, 'b_cols index') for value in b_cols], 'k': _i32(k, 'k'), 'm': _i32(m, 'm'), S5_NONCE: S5, 'n': _i32(n, 'n'), 'nonce': S5, 'rank': _i32(rank, 'rank'), 'sb': _i32(sb, 'sb'), 'sb_p': [], 'tail_mode': 1, 'tile_h': _i32(tile_h, 'tile_h'), 'tile_w': _i32(tile_w, 'tile_w'), 'worker_nonce': worker}
+    params = {'a_rows': [_i32(value, 'a_rows index') for value in a_rows], 'b_cols': [_i32(value, 'b_cols index') for value in b_cols], 'k': _i32(k, 'k'), 'm': _i32(m, 'm'), s5_nonce(): S5, 'n': _i32(n, 'n'), 'nonce': S5, 'rank': _i32(rank, 'rank'), 'sb': _i32(sb, 'sb'), 'sb_p': [], 'tail_mode': 1, 'tile_h': _i32(tile_h, 'tile_h'), 'tile_w': _i32(tile_w, 'tile_w'), 'worker_nonce': worker}
     return {'id': request_id, 'method': 'submit', 'params': [params]}

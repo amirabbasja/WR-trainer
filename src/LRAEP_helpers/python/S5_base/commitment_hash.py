@@ -2,20 +2,21 @@ import torch
 from LRAEP_trainer.CNN_3ekalb import CNN_3ekalb
 from LRAEP_gateway.comm.dataclasses import CommitmentHash
 from LRAEP_trainer.primitives import S1Configuration
-from LRAEP_trainer.wire_constants import S6_NOISE_SEED_PREFIX
+from LRAEP_trainer.wire_constants import s6_noise_seed_prefix
 from .matrix_merkle_tree import MatrixMerkleTree
-SEED_SALT_A = CNN_3ekalb(S6_NOISE_SEED_PREFIX + b'A').digest()
-SEED_SALT_B = CNN_3ekalb(S6_NOISE_SEED_PREFIX + b'B').digest()
-_BIND_PAD = b'\x00' * 28
+def seed_salt(label):
+    return CNN_3ekalb(s6_noise_seed_prefix() + label).digest()
+
+
 
 def _bind_root(merkle_root: bytes, dim: int, salt: bytes) -> bytes:
-    return CNN_3ekalb(merkle_root + dim.to_bytes(4, 'little') + _BIND_PAD, key=salt).digest()
+    return CNN_3ekalb(merkle_root + dim.to_bytes(4, 'little') + bytes(28), key=salt).digest()
 
 def bind_root_a(a_merkle_root: bytes, m: int) -> bytes:
-    return _bind_root(a_merkle_root, m, SEED_SALT_A)
+    return _bind_root(a_merkle_root, m, seed_salt(b'A'))
 
 def bind_root_b(b_merkle_root: bytes, n: int) -> bytes:
-    return _bind_root(b_merkle_root, n, SEED_SALT_B)
+    return _bind_root(b_merkle_root, n, seed_salt(b'B'))
 
 class CommitmentHasher:
 

@@ -5,7 +5,7 @@ import math
 import threading
 import time
 from typing import Any
-from .S3_protocol import KEXDialect, S1, S3Job, S3ProtocolError
+from .S3_protocol import KEXDialect, s1, S3Job, S3ProtocolError
 from .S3_transport import MAX_IO, S3ConnectionError, S3Transport
 
 class S3AuthenticationError(S3ConnectionError):
@@ -56,7 +56,10 @@ def _reject_constant(value: str) -> None:
     raise ValueError('non-finite JSON constant')
 
 class S3Session:
-    AUTH_METHOD = S1 + 'authorize'
+    @property
+    def AUTH_METHOD(self):
+        return s1() + 'authorize'
+
     MAX_FRAME_BYTES = MAX_IO
     MAX_PENDING_SUBMISSIONS = 64
 
@@ -209,7 +212,7 @@ class S3Session:
             if self._closed_event.is_set():
                 return
         method = response.get('method')
-        if method == S1 + 'notify':
+        if method == s1() + 'notify':
             job = self.dialect.parse_job(response.get('params'), self.settings.get('certificate_version'))
             with self._condition:
                 if self._closed_event.is_set():
@@ -219,7 +222,7 @@ class S3Session:
                     self._generation += 1
                     self._condition.notify_all()
             return
-        if method in ('client.reconnect', S1 + 'reconnect'):
+        if method in ('client.reconnect', s1() + 'reconnect'):
             self._fail(S3ConnectionError('S3 requested reconnection to the configured endpoint'))
             return
         if method is not None:

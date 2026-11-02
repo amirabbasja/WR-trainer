@@ -112,7 +112,7 @@ class SideJob:
     def _log(self, message, *args):
         if self.before_log is not None:
             self.before_log()
-        LOG.info(message, *args)
+        LOG.debug(message, *args)
 
     def status(self, gpu_percent=None):
         epoch = str(self._progress_epoch)
@@ -305,13 +305,14 @@ class SideJob:
 def main(argv=None):
     from .config import load_config
     from .paths import default_config_path
-    from .progress import LiveProgress
+    from .progress import LiveProgress, job_status
     from .telemetry import GpuUtilization
+    from .telegram import TelegramUpdates
     parser = argparse.ArgumentParser(description='Train the side-job page-orientation CNN on CUDA')
     parser.add_argument('--config', type=Path, default=default_config_path())
     parser.add_argument('--epochs', type=int, help='total completed epochs, including resumed epochs; 0 repeats')
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+    logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(message)s')
     job = None
     try:
         config = load_config(args.config)
@@ -327,13 +328,20 @@ def main(argv=None):
             gpu = resources.enter_context(GpuUtilization(str(telemetry_device)))
             progress = resources.enter_context(LiveProgress())
             job = SideJob(config, before_log=progress.clear)
-            progress.update(job.status(gpu.read()), force=True)
+
+            def snapshot():
+                return job_status(1, "side", gpu.read(), None, job._progress_epoch)
+
+            updates = resources.enter_context(TelegramUpdates(config, snapshot))
+            updates.event("Job 1 side starting")
+            resources.callback(updates.event, "Job 1 side finished")
+            progress.update(snapshot(), force=True)
             while job.step():
-                progress.update(job.status(gpu.read()))
-            progress.update(job.status(gpu.read()), force=True)
+                progress.update(snapshot())
+            progress.update(snapshot(), force=True)
         return 0
     except KeyboardInterrupt:
-        LOG.info('Stopped; the last completed epoch is saved')
+        LOG.debug('Stopped; the last completed epoch is saved')
         return 130
     except (ValueError, RuntimeError, OSError, ImportError) as exc:
         LOG.error('%s', exc)

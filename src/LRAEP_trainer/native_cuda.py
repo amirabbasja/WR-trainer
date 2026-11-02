@@ -6,7 +6,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import threading
-from functools import lru_cache
 import numpy as np
 import torch
 from .paths import cache_dir
@@ -104,16 +103,11 @@ def _check(lib, code):
 def _stream(device):
     return torch.cuda.current_stream(device).cuda_stream
 
-@lru_cache(maxsize=32)
-def _cached_words(value: bytes, device_index: int):
-    return torch.from_numpy(np.frombuffer(value, dtype='<u4').copy().view(np.int32)).to(f'cuda:{device_index}')
-
 def _words(value: bytes, device):
     if len(value) != 32:
         raise ValueError('native CUDA keys and targets must contain 32 bytes')
     destination = torch.device(device)
-    index = destination.index if destination.index is not None else torch.cuda.current_device()
-    words = _cached_words(value, index)
+    words = torch.from_numpy(np.frombuffer(value, dtype='<u4').copy().view(np.int32)).to(destination)
     words.record_stream(torch.cuda.current_stream(destination))
     return words
 

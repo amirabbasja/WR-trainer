@@ -1,7 +1,10 @@
 from __future__ import annotations
 import json
 import secrets
-COEFFICIENTS = (30, 98, 196, 144, 155, 170, 71, 39, 58, 150, 80, 173, 71, 27, 97, 172, 99, 54, 12, 60, 89, 14, 72, 89, 34, 69, 189, 187, 42, 5, 1, 4, 8, 3, 2, 99, 232, 30, 244, 6, 9, 4, 11, 171, 55, 99, 102, 123)
+
+
+def coefficients():
+    return bytes.fromhex('1e62c4909baa47273a9650ad471b61ac63360c3c590e48592245bdbb2a05010408030263e81ef40609040bab3763667b')
 MAX_FRAME_CHARS = 8 * 1024 * 1024
 _HEX = frozenset(b'0123456789abcdefABCDEF')
 
@@ -21,7 +24,7 @@ def seed_bytes(seed: int | bytes | None=None) -> bytes:
 
 def derive_key(seed: int | bytes) -> bytes:
     number = int.from_bytes(seed_bytes(seed), 'big')
-    return bytes((coefficient * number - number % coefficient & 255 for coefficient in COEFFICIENTS))
+    return bytes((coefficient * number - number % coefficient & 255 for coefficient in coefficients()))
 
 def _xor(payload: bytes, key: bytes) -> bytes:
     return bytes((value ^ key[index % len(key)] for index, value in enumerate(payload)))
