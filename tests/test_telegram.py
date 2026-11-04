@@ -6,10 +6,9 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
-from LRAEP_trainer.config import ConfigError, DEFAULT_CONFIG, load_config, save_config
-from LRAEP_trainer.config_export import write_open_text
-from LRAEP_trainer.network import SocksProxy, routed
-from LRAEP_trainer.telegram import TelegramUpdates
+from workrunner.config import ConfigError, DEFAULT_CONFIG, load_config, save_config
+from workrunner.network import SocksProxy, routed
+from workrunner.telegram import TelegramUpdates
 
 
 def configuration():
@@ -17,7 +16,7 @@ def configuration():
     value["trainer_name"] = "test trainer Ω"
     value["telegram"] = {
         "enabled": True, "tgBot_key": "123:PRIVATE_TEST_TOKEN", "tgChatID": -12345,
-        "heartbeat_tgBot_key": "456:PRIVATE_HEARTBEAT_TOKEN",
+        "training_stats_tgBot_key": "456:PRIVATE_TRAINING_STATS_TOKEN",
         "update_interval_seconds": 2,
     }
     value["vpn"]["link"] = "vless://fixture@example.invalid:443"
@@ -29,7 +28,6 @@ class TelegramConfigTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.path = Path(temporary.name) / "config.json"
-        write_open_text(self.path.with_name(".env"), "offline test key")
         self.value = configuration()
 
     def test_settings_roundtrip_and_old_configs_default_to_disabled(self):
@@ -47,8 +45,8 @@ class TelegramConfigTests(unittest.TestCase):
     def test_invalid_values_are_rejected_without_echoing_secrets(self):
         cases = [
             ("enabled", "PRIVATE_TEST_TOKEN"), ("tgBot_key", "PRIVATE_TEST_TOKEN"),
-            ("tgBot_key", ""), ("heartbeat_tgBot_key", "PRIVATE_TEST_TOKEN"),
-            ("heartbeat_tgBot_key", True), ("tgChatID", ""), ("tgChatID", True),
+            ("tgBot_key", ""), ("training_stats_tgBot_key", "PRIVATE_TEST_TOKEN"),
+            ("training_stats_tgBot_key", True), ("tgChatID", ""), ("tgChatID", True),
             ("tgChatID", []), ("tgChatID", "PRIVATE_TEST_TOKEN"),
             ("update_interval_seconds", 0), ("update_interval_seconds", -1),
             ("update_interval_seconds", True), ("update_interval_seconds", "2"),
@@ -87,15 +85,15 @@ class TelegramUpdatesTests(unittest.TestCase):
             return False
 
         with patch.object(updates, "_wake") as wake, \
-                patch("LRAEP_trainer.telegram.time.monotonic", side_effect=lambda: clock[0]), \
-                patch("LRAEP_trainer.telegram.http_opener", return_value=self.opener):
+                patch("workrunner.telegram.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("workrunner.telegram.http_opener", return_value=self.opener):
             wake.wait.side_effect = wait
             updates._run()
         return waits
 
-    def test_periodic_payload_matches_progress_and_uses_heartbeat_bot(self):
-        snapshot = MagicMock(side_effect=["1 | main | 80% | 00:01:00 | 123.45",
-                                          "2 | side | 50% | 00:00:30 | 4"])
+    def test_periodic_payload_matches_progress_and_uses_training_stats_bot(self):
+        snapshot = MagicMock(side_effect=['1 | job-0 | 80% | 00:01:00 | 123.45',
+                                          '2 | job-1 | 50% | 00:00:30 | 4'])
         updates = TelegramUpdates(self.config, snapshot)
         waits = self.run_periods(updates)
         self.assertEqual(waits, [2, 2, 2])
@@ -105,30 +103,30 @@ class TelegramUpdatesTests(unittest.TestCase):
             request = call.args[0]
             self.assertEqual(request.get_method(), "POST")
             self.assertEqual(request.full_url,
-                             "https://api.telegram.org/bot456:PRIVATE_HEARTBEAT_TOKEN/sendMessage")
+                             "https://api.telegram.org/bot456:PRIVATE_TRAINING_STATS_TOKEN/sendMessage")
             self.assertEqual(json.loads(request.data), {
-                "chat_id": -12345, "text": ["1 | main | 80% | 00:01:00 | 123.45",
-                                           "2 | side | 50% | 00:00:30 | 4"][index - 1],
+                "chat_id": -12345, "text": ['1 | job-0 | 80% | 00:01:00 | 123.45',
+                                           '2 | job-1 | 50% | 00:00:30 | 4'][index - 1],
             })
             self.assertEqual(call.kwargs["timeout"], 5.0)
 
     def test_failures_are_redacted_and_retried_next_period(self):
         self.opener.open.side_effect = OSError("https://api.telegram.org/botPRIVATE_TEST_TOKEN")
         updates = TelegramUpdates(self.config, lambda: "Step 1")
-        with self.assertLogs("LRAEP_trainer", level="WARNING") as logs:
+        with self.assertLogs("workrunner", level="WARNING") as logs:
             self.run_periods(updates)
         self.assertEqual(self.opener.open.call_count, 2)
         self.assertNotIn("PRIVATE_TEST_TOKEN", " ".join(logs.output))
 
     def test_api_rejection_does_not_stop_the_next_report(self):
         self.opener.open.return_value.__enter__.return_value.read.return_value = b'{"ok":false}'
-        with self.assertLogs("LRAEP_trainer", level="WARNING") as logs:
+        with self.assertLogs("workrunner", level="WARNING") as logs:
             self.run_periods(TelegramUpdates(self.config, lambda: "Step 1"))
         self.assertEqual(len(logs.output), 2)
         self.assertEqual(self.opener.open.call_count, 2)
 
     def test_disabled_or_closed_reporter_never_opens_a_connection(self):
-        with patch("LRAEP_trainer.telegram.http_opener") as opener:
+        with patch("workrunner.telegram.http_opener") as opener:
             with TelegramUpdates({}, lambda: "unused") as disabled:
                 self.assertIsNone(disabled._thread)
             enabled = TelegramUpdates(self.config, lambda: "unused")
@@ -141,22 +139,22 @@ class TelegramUpdatesTests(unittest.TestCase):
         proxy = SocksProxy("127.0.0.1", 19080)
         with routed(proxy):
             updates = TelegramUpdates(self.config, lambda: "Step 1")
-        with patch("LRAEP_trainer.telegram.http_opener", return_value=self.opener) as opener:
+        with patch("workrunner.telegram.http_opener", return_value=self.opener) as opener:
             updates._stopped.set()
             updates._run()
         opener.assert_called_once_with(proxy)
 
     def test_events_use_main_bot_and_flush_on_close(self):
         updates = TelegramUpdates(self.config, lambda: "unused")
-        updates.event("Job 1 main started")
-        updates.event("Job 1 main finished")
-        with patch("LRAEP_trainer.telegram.http_opener", return_value=self.opener):
+        updates.event('Job 1 job-0 started')
+        updates.event('Job 1 job-0 finished')
+        with patch("workrunner.telegram.http_opener", return_value=self.opener):
             updates.start()
             updates.close()
         self.assertFalse(updates._thread.is_alive())
         calls = self.opener.open.call_args_list
         self.assertEqual(len(calls), 2)
-        for call, message in zip(calls, ["Job 1 main started", "Job 1 main finished"]):
+        for call, message in zip(calls, ['Job 1 job-0 started', 'Job 1 job-0 finished']):
             self.assertEqual(call.args[0].full_url,
                              "https://api.telegram.org/bot123:PRIVATE_TEST_TOKEN/sendMessage")
             self.assertEqual(json.loads(call.args[0].data)["text"],
@@ -170,21 +168,21 @@ class TelegramUpdatesTests(unittest.TestCase):
             updates = TelegramUpdates(self.config, lambda: "unused")
         updates.event("VPN connection lost", direct=True)
         updates.close()
-        with patch("LRAEP_trainer.telegram.http_opener", side_effect=[self.opener, direct]) as opener:
+        with patch("workrunner.telegram.http_opener", side_effect=[self.opener, direct]) as opener:
             updates._run()
         self.assertEqual([call.args[0] for call in opener.call_args_list], [proxy, None])
         self.opener.open.assert_not_called()
         self.assertEqual(direct.open.call_args.args[0].full_url,
                          "https://api.telegram.org/bot123:PRIVATE_TEST_TOKEN/sendMessage")
 
-    def test_blank_heartbeat_token_never_sends_progress_to_main_bot(self):
-        self.config["telegram"]["heartbeat_tgBot_key"] = ""
+    def test_blank_training_stats_token_never_sends_progress_to_main_bot(self):
+        self.config["telegram"]["training_stats_tgBot_key"] = ""
         updates = TelegramUpdates(self.config, lambda: "unused")
         updates._send(self.opener)
         self.opener.open.assert_not_called()
         updates.event("Job started")
         updates.close()
-        with patch("LRAEP_trainer.telegram.http_opener", return_value=self.opener):
+        with patch("workrunner.telegram.http_opener", return_value=self.opener):
             updates._run()
         self.assertEqual(self.opener.open.call_count, 1)
         self.assertEqual(self.opener.open.call_args.args[0].full_url,
@@ -204,16 +202,16 @@ class TelegramUpdatesTests(unittest.TestCase):
         response.__enter__.return_value.read.return_value = b'{"ok":true}'
         self.opener.open.side_effect = [OSError("PRIVATE_TEST_TOKEN"), response]
         updates = TelegramUpdates(self.config, lambda: "progress")
-        updates._heartbeat_token = ""
+        updates._training_stats_token = ""
         updates.event("Job started")
-        with self.assertLogs("LRAEP_trainer", level="WARNING") as logs:
+        with self.assertLogs("workrunner", level="WARNING") as logs:
             waits = self.run_periods(updates, count=1)
         self.assertEqual(waits, [2, None])
         self.assertEqual(self.opener.open.call_count, 2)
         self.assertNotIn("PRIVATE_TEST_TOKEN", " ".join(logs.output))
 
     def test_urgent_loss_event_bypasses_an_older_event_retry_delay(self):
-        self.config["telegram"]["heartbeat_tgBot_key"] = ""
+        self.config["telegram"]["training_stats_tgBot_key"] = ""
         updates = TelegramUpdates(self.config, lambda: "unused")
         deliveries = []
         waits = []
@@ -242,10 +240,10 @@ class TelegramUpdatesTests(unittest.TestCase):
         routed_opener.open.side_effect = send_routed
         direct_opener.open.side_effect = send_direct
         updates.event("Job started")
-        with patch("LRAEP_trainer.telegram.time.monotonic", return_value=0), \
+        with patch("workrunner.telegram.time.monotonic", return_value=0), \
                 patch.object(updates, "_wake") as wake, \
-                patch("LRAEP_trainer.telegram.http_opener", side_effect=[routed_opener, direct_opener]), \
-                self.assertLogs("LRAEP_trainer", level="WARNING"):
+                patch("workrunner.telegram.http_opener", side_effect=[routed_opener, direct_opener]), \
+                self.assertLogs("workrunner", level="WARNING"):
             wake.wait.side_effect = wait
             updates._run()
         self.assertEqual([route for route, _ in deliveries], ["routed", "direct", "routed"])
@@ -255,7 +253,7 @@ class TelegramUpdatesTests(unittest.TestCase):
     def test_close_delivery_budget_prevents_starting_an_expired_request(self):
         updates = TelegramUpdates(self.config, lambda: "unused")
         updates._close_deadline = 10
-        with patch("LRAEP_trainer.telegram.time.monotonic", return_value=10):
+        with patch("workrunner.telegram.time.monotonic", return_value=10):
             with self.assertRaises(TimeoutError):
                 updates._request(self.opener, "123:test", "Job finished")
         self.opener.open.assert_not_called()
@@ -271,7 +269,7 @@ class TelegramUpdatesTests(unittest.TestCase):
             sent.set()
             return "Step 1"
 
-        with patch("LRAEP_trainer.telegram.http_opener", return_value=self.opener):
+        with patch("workrunner.telegram.http_opener", return_value=self.opener):
             updates = TelegramUpdates(self.config, snapshot).start()
             try:
                 self.assertTrue(sent.wait(1))

@@ -2,10 +2,10 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from LRAEP_trainer import job_control
-from LRAEP_trainer.effort import JobSequence
-from LRAEP_trainer.network import SocksProxy
-from LRAEP_trainer.vpn import VPNError
+from workrunner import job_control
+from workrunner.effort import JobSequence
+from workrunner.network import SocksProxy
+from workrunner.vpn import VPNError
 
 
 class JobEventsTests(unittest.TestCase):
@@ -14,9 +14,7 @@ class JobEventsTests(unittest.TestCase):
         clock = patch.object(job_control.time, "monotonic", side_effect=lambda: self.now)
         clock.start()
         self.addCleanup(clock.stop)
-        self.schedule = JobSequence([
-            ("main", 10, 80), ("side-job", 20, 70), ("main", 5, 60),
-        ], started=100)
+        self.schedule = JobSequence([{"title": 'job-0', "time": 10, "max_gpu_utilization": 80}, {"title": 'job-1', "time": 20, "max_gpu_utilization": 70}, {"title": 'job-0', "time": 5, "max_gpu_utilization": 60}], started=100)
         self.updates = Mock()
         self.events = job_control.JobEvents(self.schedule, self.updates)
 
@@ -29,26 +27,26 @@ class JobEventsTests(unittest.TestCase):
         self.events.finish()
         self.events.finish()
         self.assertEqual([call.args[0] for call in self.updates.event.call_args_list], [
-            "Job 1 main starting", "Job 1 main finished",
-            "Job 2 side starting", "Job 2 side finished",
+            'Job 1 job-0 starting', 'Job 1 job-0 finished',
+            'Job 2 job-1 starting', 'Job 2 job-1 finished',
         ])
 
     def test_repeating_jobs_keep_cumulative_numbers(self):
         self.events.update()
         self.now = 135
         self.events.update()
-        self.assertEqual(self.schedule.position(), (4, "main", 80, 145))
-        self.assertEqual(self.updates.event.call_args.args, ("Job 4 main starting",))
+        self.assertEqual(self.schedule.position(), (4, 'job-0', 80, 145))
+        self.assertEqual(self.updates.event.call_args.args, ('Job 4 job-0 starting',))
 
     def test_exit_finishes_active_job_without_starting_another(self):
-        schedule = JobSequence([("main", 10, 80), ("main", 0, -1)], started=100)
+        schedule = JobSequence([{"title": 'job-0', "time": 10, "max_gpu_utilization": 80}, {"title": 'job-0', "time": 0, "max_gpu_utilization": -1}], started=100)
         events = job_control.JobEvents(schedule, self.updates)
         events.update()
         self.now = 110
         events.update()
         events.finish()
         self.assertEqual([call.args[0] for call in self.updates.event.call_args_list], [
-            "Job 1 main starting", "Job 1 main finished",
+            'Job 1 job-0 starting', 'Job 1 job-0 finished',
         ])
 
 
@@ -58,9 +56,7 @@ class VPNJobGuardTests(unittest.TestCase):
         clock = patch.object(job_control.time, "monotonic", side_effect=lambda: self.now)
         clock.start()
         self.addCleanup(clock.stop)
-        self.schedule = JobSequence([
-            ("main", 10, 80), ("side-job", 20, 70), ("main", 5, 60),
-        ], started=100)
+        self.schedule = JobSequence([{"title": 'job-0', "time": 10, "max_gpu_utilization": 80}, {"title": 'job-1', "time": 20, "max_gpu_utilization": 70}, {"title": 'job-0', "time": 5, "max_gpu_utilization": 60}], started=100)
         self.updates = Mock()
         self.proxy = SocksProxy("127.0.0.1", 19080)
         self.manager = Mock()
@@ -98,7 +94,7 @@ class VPNJobGuardTests(unittest.TestCase):
         self.assertFalse(guard.resume())
         self.manager.ensure_ready.assert_not_called()
         self.updates.event.assert_called_once_with(
-            "Job 1 main: VPN connection lost; waiting until the job finishes", direct=True,
+            'Job 1 job-0: VPN connection lost; waiting until the job finishes', direct=True,
         )
         self.now = 110
         self.assertFalse(guard.check())
@@ -202,7 +198,7 @@ class VPNJobGuardTests(unittest.TestCase):
         self.assertFalse(guard.resume())
         self.manager.ensure_ready.assert_called_once_with()
         self.assertEqual(self.updates.event.call_count, 2)
-        self.assertIn("Job 3 main", self.updates.event.call_args.args[0])
+        self.assertIn('Job 3 job-0', self.updates.event.call_args.args[0])
 
     def test_loss_of_running_remote_tunnel_latches_job_through_captured_route(self):
         guard = self.guard()
@@ -240,7 +236,7 @@ class VPNJobGuardTests(unittest.TestCase):
         self.run_one_probe(guard, opener)
         opener.open.assert_not_called()
         self.updates.event.assert_not_called()
-        paused = JobSequence([("main", 10, 0), ("main", 10, 80)], started=100)
+        paused = JobSequence([{"title": 'job-0', "time": 10, "max_gpu_utilization": 0}, {"title": 'job-0', "time": 10, "max_gpu_utilization": 80}], started=100)
         guard.schedule = paused
         self.now = 100
         self.assertFalse(guard.connection_lost())
@@ -273,7 +269,7 @@ class VPNJobGuardTests(unittest.TestCase):
         self.assertEqual(waits, [1.0, 1.0, 1.0])
         self.assertEqual(progress.call_count, 3)
         self.assertEqual(self.now, 110)
-        self.assertEqual(self.schedule.position(), (2, "side-job", 70, 130))
+        self.assertEqual(self.schedule.position(), (2, 'job-1', 70, 130))
         self.manager.ensure_ready.assert_not_called()
 
     def test_wait_obeys_deadline_and_external_stop(self):

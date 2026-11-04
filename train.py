@@ -138,16 +138,16 @@ def run(root=None, *, login_only=False):
 
     root = Path(root or Path(__file__).parent).resolve()
     sys.path.insert(0, str(root / 'src'))
-    os.environ.setdefault('LRAEP_CACHE_DIR', str(root / '.runtime/cache'))
-    os.environ.setdefault('LRAEP_DATA_DIR', str(root / '.runtime'))
+    from workrunner.paths import set_checkout_directories
+    set_checkout_directories(root)
     logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(message)s', stream=sys.stdout, force=True)
     try:
-        from LRAEP_trainer.config import load_config, resolve_S3_settings
-        from LRAEP_trainer.network import routed
-        from LRAEP_trainer.S3_training import run_S3_training, validate_S3_endpoint, validate_S3_identity
-        from LRAEP_trainer.vpn import ManagedVPN
+        from workrunner.config import load_config, resolve_S3_settings
+        from workrunner.network import routed
+        from workrunner.S3_training import run_S3_training, validate_S3_endpoint, validate_S3_identity
+        from workrunner.vpn import ManagedVPN
         config = load_config(root / 'config.json')
-        if not login_only and config['training']['job_sequence'][0][2] == -1:
+        if not login_only and config['training']['job_sequence'][0]['max_gpu_utilization'] == -1:
             return 0
         config['S3'] = resolve_S3_settings(config['S3'])
         if config['S3']['protocol'] != 'WR':
