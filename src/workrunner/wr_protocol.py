@@ -145,11 +145,11 @@ class WRDialect:
             return 'reply'
         if request_id != -1 or status != 1 or response.get('error') is not None or (not isinstance(result, list)) or (not result):
             raise S3ProtocolError(constant_text(b'^2yA}$k54$^pJ<t!qw5j)rZx>*3!b%(}&2_ht<N=*T~7#!iUt)#@E6'))
-        if result[0] == wire.SERVER_SEED:
+        if wire.text_matches('SERVER_SEED', result[0]):
             if len(result) != 2:
                 raise S3ProtocolError(constant_text(_BAD_SERVER_SEED))
             _hex_bytes(result[1], 8, wire.SERVER_SEED)
-            return wire.SERVER_SEED
+            return result[0]
         if result[0] == wire.JOB_UPDATE:
             if len(result) != 5 or not all((isinstance(field, str) for field in result)):
                 raise S3ProtocolError(constant_text(_UPDATE_SCHEMA_ERROR))
@@ -160,7 +160,7 @@ class WRDialect:
 
     @staticmethod
     def parse_server_seed(result: list) -> bytes:
-        if not isinstance(result, list) or len(result) != 2 or result[0] != wire.SERVER_SEED:
+        if not isinstance(result, list) or len(result) != 2 or not wire.text_matches('SERVER_SEED', result[0]):
             raise S3ProtocolError(constant_text(_BAD_SERVER_SEED))
         return _hex_bytes(result[1], 8, wire.SERVER_SEED)
 

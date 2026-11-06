@@ -1,11 +1,10 @@
 from __future__ import annotations
-from .fixed_constants import constant_text
+from .fixed_constants import constant_text, neutral_protocol_text
 from dataclasses import replace
 import logging
 import threading
 import time
 from typing import Callable
-from .S6_codec import CodecError, decode_frame, encode_frame
 from .S3_client import JobSnapshot, S3AuthenticationError, S3CompatibilityError, S3Session, _seconds
 from .S3_protocol import S3ProtocolError
 from .S3_transport import S3ConnectionError
@@ -68,6 +67,7 @@ class WRSession(S3Session):
             self._expire_reports_locked()
             return self._latest_report_ok
 
+    @neutral_protocol_text()
     def send_device_report(self, gpu_name: str, work_rate: float) -> int:
         self.dialect.report_request(gpu_name, work_rate, 0)
         with self._send_lock:
@@ -102,18 +102,15 @@ class WRSession(S3Session):
                 self._fail(S3ConnectionError(constant_text(b'^puCx!qn8x$jOJ))5zD?!ov')))
                 return
 
+    @neutral_protocol_text()
     def _send(self, message: dict) -> None:
-        encoded = None
         try:
             try:
-                encoded = encode_frame(message)
-            except CodecError as error:
-                raise S3ProtocolError(constant_text(b'<jB&?!-vVp(}%*z#K^<KhxCw#)xy@&!qn3')) from error
-            if len(encoded) > self.MAX_FRAME_BYTES:
-                raise S3ProtocolError(constant_text(b'^pJ<u!q(El)YFH;-^9Yg!_<e<&%%en)yB%ght$s9!iUSw%Ffd'))
-            self.transport.send(encoded)
+                self.transport.send_message(message, profile="wr", max_frame=self.MAX_FRAME_BYTES)
+            except (TypeError, ValueError, RecursionError):
+                raise S3ProtocolError("WR request cannot be serialized within the frame limit") from None
         finally:
-            del message, encoded
+            del message
 
     def _unknown(self, frame: bytes, response: dict | None, reason: str) -> None:
         with self._condition:
@@ -137,62 +134,73 @@ class WRSession(S3Session):
         with self._condition:
             self._failure = error
             self._compatibility_failure = error
-        self._fail(error)
         self.stop_event.set()
+        self._fail(error)
         with self._condition:
             self._recording_unknown = False
             self._condition.notify_all()
 
+    @neutral_protocol_text()
     def _read_loop(self) -> None:
-        buffered = bytearray()
         try:
             while not self._closed_event.is_set():
-                buffered.extend(self.transport.receive(65536))
-                while True:
-                    boundary = buffered.find(b'\n')
-                    if boundary < 0:
-                        if len(buffered) >= self.MAX_FRAME_BYTES:
-                            self._unknown(bytes(buffered), None, constant_text(b'^pJ<a)yB%ghr-{)!otJUhtto(ht$s9!iUSw%Ffd'))
-                            return
-                        break
-                    if boundary + 1 > self.MAX_FRAME_BYTES:
-                        self._unknown(bytes(buffered[:boundary + 1]), None, constant_text(b'^pJ<a)yB%ghr-{)!otJUhtto(ht$s9!iUSw%Ffd'))
-                        return
-                    frame = bytes(buffered[:boundary + 1])
-                    del buffered[:boundary + 1]
-                    response = None
+                try:
+                    response = self.transport.receive_message(profile="wr", max_frame=self.MAX_FRAME_BYTES)
+                except (ValueError, TypeError, UnicodeError, RecursionError):
+                    frame = self.transport.message_frame()
                     try:
-                        response = decode_frame(frame)
+                        self._unknown(frame, None, "Malformed or oversized WR frame")
+                    finally:
+                        self.transport.discard_message_frame()
+                        del frame
+                    return
+                except S3ConnectionError as error:
+                    frame = self.transport.message_frame()
+                    try:
+                        if frame and not self._closed_event.is_set():
+                            self._unknown(frame, None, "WR connection closed with an incomplete frame")
+                        else:
+                            self._fail(error)
+                    finally:
+                        self.transport.discard_message_frame()
+                        del frame
+                    return
+                try:
+                    if response is not None:
                         self._handle(response)
-                    except UnknownWRRequest as error:
-                        if self.settings.get('stop_on_unknown_request', True):
+                except UnknownWRRequest as error:
+                    frame = self.transport.message_frame()
+                    try:
+                        if self.settings.get("stop_on_unknown_request", True):
                             self._unknown(frame, response, str(error))
                             return
-                        try:
-                            if self._unknown_handler is not None:
+                        if self._unknown_handler is not None:
+                            try:
                                 self._unknown_handler(frame, response, str(error), fatal=False)
-                        except Exception:
-                            self._unknown(frame, response, constant_text(b'<jB&?!-vVp(}&f<#K_gdht9ys$koEbhxCw#)xy@&!qn3'))
-                            return
-                    except (CodecError, S3ProtocolError) as error:
-                        self._unknown(frame, response, str(error))
+                            except Exception:
+                                self._unknown(frame, response, "Could not record the unknown WR message")
+                                return
+                    finally:
+                        del frame
+                except S3ProtocolError:
+                    frame = self.transport.message_frame()
+                    try:
+                        self._unknown(frame, response, "Malformed or unsupported WR message")
                         return
-                    if self._closed_event.is_set():
-                        return
-        except S3ConnectionError as error:
-            if buffered and (not self._closed_event.is_set()):
-                self._unknown(bytes(buffered), None, constant_text(b'^pJ<d$jQmV#M92m$%n$p!@|Rd(9YA(hsMc=(#g}p)ymGv#?!*Xhr!jx%EA'))
-            else:
-                self._fail(error)
+                    finally:
+                        del frame
+                finally:
+                    self.transport.discard_message_frame()
+                    del response
         except Exception:
-            self._fail(S3ConnectionError(constant_text(b'^pJ<u!p6hG)rY~x&db8X')))
+            self._fail(S3ConnectionError("WR reader failed"))
 
     def _handle(self, response: dict) -> None:
         with self._condition:
             if self._closed_event.is_set():
                 return
         kind = self.dialect.classify(response)
-        if kind == wire.SERVER_SEED:
+        if wire.text_matches('SERVER_SEED', kind):
             device_seed = self.dialect.parse_server_seed(response['result'])
             with self._condition:
                 if self._closed_event.is_set():

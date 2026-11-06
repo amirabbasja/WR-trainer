@@ -10,7 +10,6 @@ from urllib.parse import urlsplit
 from .config_export import DEFAULT_DECRYPT_KEY, ExportError, decode_config_document, encode_config_document
 from .effort import normalize_job_sequence
 from .paths import artifacts_dir, resolve_helper_source
-from .wire_constants import s7_legacy_alias
 from . import wire_constants as wire
 from .fixed_constants import constant_text
 
@@ -205,9 +204,12 @@ def _documentation(value, directory, field='S3.protocol_documentation'):
 def _S3_protocol(value):
     if value == 'auto':
         raise ConfigError('S3.protocol must explicitly select KEX or WR; automatic detection is unavailable')
-    if not isinstance(value, str) or value not in {'KEX', 'WR', 'S7', s7_legacy_alias()}:
-        raise ConfigError('S3.protocol must select KEX or WR')
-    return 'WR' if value in {'S7', s7_legacy_alias()} else value
+    if isinstance(value, str):
+        if value in ('KEX', 'WR'):
+            return value
+        if value == 'S7' or wire.text_matches('LEGACY_MODE', value):
+            return 'WR'
+    raise ConfigError('S3.protocol must select KEX or WR')
 
 def _validate_S3_connection(settings, section, directory):
     settings['host'] = _host(settings['host'], f'{section}.host')

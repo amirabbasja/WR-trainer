@@ -8,7 +8,7 @@ def tensor_domain(is_b=False):
 
 
 def certificate_salt(digest_type, label):
-    with constant_buffer(b'*TTlt%ZS9n)zga6l!(d5&eXz+)WX8Uhy') as domain:
+    with constant_buffer('noise_seed_domain') as domain:
         domain.extend(label)
         return digest_type(domain).digest()
 

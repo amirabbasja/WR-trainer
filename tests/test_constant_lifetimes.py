@@ -3,7 +3,7 @@ from hashlib import sha256
 import unittest
 from unittest.mock import patch
 
-from workrunner import S6_codec, wire_constants, wr_protocol
+from workrunner import S3_methods, S6_codec, wire_constants, wr_protocol
 from workrunner.S3_protocol import KEXDialect
 from workrunner.fixed_constants import constant_buffer
 
@@ -35,8 +35,24 @@ class ConstantLifetimeTests(unittest.TestCase):
 
     def test_protocol_constants_are_not_decoded_globals_or_defaults(self):
         self.assertNotIn('NOISE_LABEL', vars(wire_constants))
-        self.assertTrue(all(isinstance(value, bytes) for value in wire_constants._TEXT.values()))
+        self.assertTrue(all(isinstance(value, (bytes, str)) for value in wire_constants._TEXT.values()))
+        self.assertTrue(all(isinstance(value, str) for value in S3_methods._REQUEST_METHODS.values()))
+        self.assertTrue(all(isinstance(value, (bytes, str)) for value, _ in S3_methods._NOTIFICATION_METHODS))
         dialect = KEXDialect('account', 'unit')
         self.assertNotIsInstance(dialect._agent, str)
         self.assertEqual(dialect.agent, wire_constants.CLIENT_AGENT)
         self.assertEqual(dialect.auth_requests()[0]['method'], 'compute.register')
+
+    def test_notification_and_legacy_comparisons_do_not_create_decoded_strings(self):
+        from workrunner.config import _S3_protocol
+        from workrunner.S3_training import select_S3_protocol, validate_S3_endpoint
+
+        legacy = bytes.fromhex('706561726c68617368').decode('ascii')
+        with patch.object(S3_methods, 'constant_text', side_effect=AssertionError('decoded string created')):
+            self.assertEqual(S3_methods.s4_notification_method('mining.notify'), S3_methods.WORK_UPDATE)
+            self.assertIsNone(S3_methods.s4_notification_method('unknown'))
+        with patch.object(wire_constants, 'constant_text', side_effect=AssertionError('decoded string created')):
+            self.assertEqual(_S3_protocol(legacy), 'WR')
+            self.assertEqual(select_S3_protocol({'protocol': legacy}), 'WR')
+            with self.assertRaisesRegex(ValueError, 'WR'):
+                validate_S3_endpoint({'protocol': legacy, 'host': ''})

@@ -18,7 +18,6 @@ from .telegram import TelegramUpdates
 from .job_control import JobEvents, VPNJobGuard
 from .progress import job_status
 from . import native_cuda
-from .wire_constants import s7_legacy_alias
 from . import wire_constants as wire
 from .fixed_constants import constant_text
 
@@ -70,7 +69,7 @@ def select_S3_protocol(settings: dict) -> str:
     selected = settings.get('protocol', 'KEX')
     if selected == 'auto':
         raise ValueError(constant_text(b'^puI$)yUJx#K_Bs%F@)+hr-|2%g)5k)63q6)WXZc#M6iD;{S)p)rau)oQKBJ)5yxk)6T?)!@|?T#M92m$%oF=htkQ$(Z<fp#>LCR'))
-    if selected in (constant_text(b'^pF'), s7_legacy_alias()):
+    if selected == constant_text(b'^pF') or wire.text_matches('LEGACY_MODE', selected):
         selected = 'WR'
     if selected not in ('KEX', 'WR'):
         raise ValueError(constant_text(b'^puI$)yUJx#K_Bs%F@)+ht$H$!o<^u?Bf52$km7N^#'))
@@ -79,7 +78,8 @@ def select_S3_protocol(settings: dict) -> str:
 def validate_S3_endpoint(settings: dict) -> None:
     host = settings.get('host', '')
     if not isinstance(host, str) or not host.strip():
-        profile = 'WR' if settings.get('protocol') in ('WR', constant_text(b'^pF'), s7_legacy_alias()) else 'KEX'
+        selected = settings.get('protocol')
+        profile = 'WR' if selected in ('WR', constant_text(b'^pF')) or wire.text_matches('LEGACY_MODE', selected) else 'KEX'
         raise ValueError(f"{constant_text(b'!OqLehxC+*&&br%hr!6zhsKA&%f{1(#K_6P&cM>u#?#Ko$%}``)ra(yi2')}{profile}{constant_text(b'iO<N?(}&K<htto(ht$u;)xyJv#K_6P&cM>u#?#Ko$%}{3&eP9_-pJC`hxC+(&&br%$;QgUhsf23?)Qhr!^73W)YJ')}")
 
 def validate_S3_identity(settings: dict, selected_protocol: str | None=None, *, validate_address: bool=True) -> None:

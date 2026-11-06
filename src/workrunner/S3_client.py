@@ -1,6 +1,5 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-import json
 import math
 import threading
 import time
@@ -9,7 +8,7 @@ from . import S3_methods as methods
 from .S3_protocol import KEXDialect, S3Job, S3ProtocolError
 from .S3_transport import MAX_IO, S3ConnectionError, S3Transport
 from . import wire_constants as wire
-from .fixed_constants import constant_text
+from .fixed_constants import constant_text, neutral_protocol_text
 
 _SEND_FAILED = b'^puCx&&Jilht$H!!-v7f&db8X'
 _ACK_TIMED_OUT = b'^puCx&&JilhsMOr$;i;l!o$GA%EHOhhttl=!o!Ei($f'
@@ -53,16 +52,7 @@ def _seconds(value: float, *, allow_zero: bool=False) -> float:
         raise ValueError(constant_text(b'^puCt#?I4+)6UAm$kNk?%F@)+hsDB&#)sF))Xvk+(ZYwp&dJWx!iUMy%EiLf'))
     return seconds
 
-def _json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result = {}
-    for name, value in pairs:
-        if name in result:
-            raise ValueError('duplicate JSON field')
-        result[name] = value
-    return result
 
-def _reject_constant(value: str) -> None:
-    raise ValueError('non-finite JSON constant')
 
 class S3Session:
     AUTH_METHOD = methods.COMPUTE_SESSION
@@ -107,6 +97,7 @@ class S3Session:
         if self.stop_event.is_set() or self._closed_event.is_set():
             raise S3ConnectionError(constant_text(b'^puCx!qn8x$jOJ!)Q8m5$k*4x!v'))
 
+    @neutral_protocol_text()
     def open(self) -> S3Session:
         with self._condition:
             self._raise_failure()
@@ -181,49 +172,36 @@ class S3Session:
                 self._fail(S3ConnectionError(constant_text(b'^puCx!qn8x$jOJ))5zD?!ov')))
                 return
 
+    @neutral_protocol_text()
     def _send(self, message: dict[str, Any]) -> None:
-        encoded = None
         try:
             message = methods.s4_request(message)
-            encoded = json.dumps(message, separators=(',', ':'), allow_nan=False).encode('utf-8') + b'\n'
-            if len(encoded) > self.MAX_FRAME_BYTES:
-                raise S3ProtocolError(constant_text(b'^puCy!q(El)YFH;-^9Yg!_<e<&%%en)yB%ght$s9!iUSw%Ffd'))
-            self.transport.send(encoded)
+            try:
+                self.transport.send_message(message, profile="s3", max_frame=self.MAX_FRAME_BYTES)
+            except (TypeError, ValueError, RecursionError):
+                raise S3ProtocolError("S3 request cannot be serialized within the frame limit") from None
         finally:
-            del message, encoded
+            del message
 
+    @neutral_protocol_text()
     def _read_loop(self) -> None:
-        buffered = bytearray()
         try:
             while not self._closed_event.is_set():
-                buffered.extend(self.transport.receive(65536))
-                while True:
-                    boundary = buffered.find(b'\n')
-                    if boundary < 0:
-                        if len(buffered) >= self.MAX_FRAME_BYTES:
-                            raise S3ProtocolError(constant_text(b'^puCn!qn8pz`}>Z-^9Yg!_<e<&%%en)yB%ght$s9!iUSw%Ffd'))
-                        break
-                    if boundary + 1 > self.MAX_FRAME_BYTES:
-                        raise S3ProtocolError(constant_text(b'^puCn!qn8pz`}>Z-^9Yg!_<e<&%%en)yB%ght$s9!iUSw%Ffd'))
-                    frame = bytes(buffered[:boundary])
-                    del buffered[:boundary + 1]
-                    if not frame.strip():
-                        continue
-                    try:
-                        response = json.loads(frame, object_pairs_hook=_json_object, parse_constant=_reject_constant)
-                    except (ValueError, UnicodeError, RecursionError):
-                        raise S3ProtocolError(constant_text(b'^puCx!pYNz%ErsV$koci!-wtk=;;')) from None
-                    if not isinstance(response, dict):
-                        raise S3ProtocolError(constant_text(b'^puCn!qn8pz{1pr%F@)+hsDB&?eysBhsedv!o<_m'))
-                    self._handle(response)
-                    if self._closed_event.is_set():
-                        return
+                try:
+                    response = self.transport.receive_message(profile="s3", max_frame=self.MAX_FRAME_BYTES)
+                except (ValueError, TypeError, UnicodeError, RecursionError):
+                    raise S3ProtocolError("S3 sent a malformed or oversized message") from None
+                try:
+                    if response is not None:
+                        self._handle(response)
+                finally:
+                    del response
         except S3ConnectionError as error:
             self._fail(error)
         except S3ProtocolError as error:
             self._fail(S3CompatibilityError(str(error)))
         except Exception:
-            self._fail(S3ConnectionError(constant_text(b'^puCy!p6hG)rY~x&db8X')))
+            self._fail(S3ConnectionError("S3 reader failed"))
 
     def _handle(self, response: dict[str, Any]) -> None:
         with self._condition:
@@ -281,6 +259,7 @@ class S3Session:
         with self._condition:
             return isinstance(snapshot, JobSnapshot) and self._authorized and (self._failure is None) and (not self.stop_event.is_set()) and (not self._closed_event.is_set()) and (snapshot.generation == self._generation) and (snapshot.job == self._job)
 
+    @neutral_protocol_text()
     def send_result(self, snapshot: JobSnapshot, proof_b64: str, timeout: float | None=None) -> SubmissionResult:
         wait_seconds = _seconds(self.transport.read_timeout if timeout is None else timeout)
         with self._send_lock:

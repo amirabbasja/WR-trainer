@@ -5,6 +5,7 @@ import os
 import re
 import socket
 import ssl
+import threading
 from . import network
 MAX_IO = 8 * 1024 * 1024
 _DNS_LABEL = re.compile('[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\Z')
@@ -65,6 +66,8 @@ class S3Transport:
         self.read_timeout = _timeout(read_timeout, 'read')
         self._socket: socket.socket | None = None
         self._proxy = network.current_proxy()
+        self._message_channels = {}
+        self._message_lock = threading.Lock()
 
     @property
     def endpoint(self) -> str:
@@ -120,6 +123,58 @@ class S3Transport:
                 connection.close()
             except OSError:
                 pass
+        with self._message_lock:
+            channels, self._message_channels = self._message_channels, {}
+        for channel in channels.values():
+            channel.close()
+
+    def _message_channel(self, profile, max_frame):
+        from .wire_io import NativeChannel
+
+        with self._message_lock:
+            connection = self._connected()
+            channel = self._message_channels.get(profile)
+            if channel is None:
+                channel = NativeChannel(connection, profile=profile, max_frame=max_frame)
+                self._message_channels[profile] = channel
+            return channel
+
+    def send_message(self, message, *, profile="s3", max_frame=MAX_IO):
+        """Serialize and send through scoped native buffers, using neutral names."""
+        try:
+            channel = self._message_channel(profile, max_frame)
+            try:
+                channel.send(message)
+            except TimeoutError:
+                self.close()
+                raise S3ConnectionError(f"S3 send timed out: {self.endpoint}") from None
+            except OSError:
+                self.close()
+                raise S3ConnectionError(f"S3 send failed: {self.endpoint}") from None
+        finally:
+            del message
+
+    def receive_message(self, *, profile="s3", max_frame=MAX_IO):
+        """Receive into native memory and expose only the neutral parsed object."""
+        channel = self._message_channel(profile, max_frame)
+        try:
+            return channel.receive()
+        except TimeoutError:
+            raise S3ConnectionError(f"S3 receive timed out: {self.endpoint}") from None
+        except OSError:
+            # The session may still need the encoded WR frame for diagnostics.
+            # It closes this transport after recording that frame.
+            raise S3ConnectionError(f"S3 receive failed or closed: {self.endpoint}") from None
+
+    def message_frame(self, *, profile="wr"):
+        channel = self._message_channels.get(profile)
+        return b"" if channel is None else channel.last_frame()
+
+    def discard_message_frame(self, *, profile="wr"):
+        channel = self._message_channels.get(profile)
+        if channel is not None:
+            channel.discard_frame()
+
 
     def __enter__(self) -> S3Transport:
         return self.open()

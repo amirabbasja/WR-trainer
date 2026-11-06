@@ -1,7 +1,10 @@
 import hashlib
+from contextlib import contextmanager
 import unittest
+from unittest.mock import patch
 
-from workrunner.fixed_constants import constant_buffer, constant_bytes, constant_text
+from workrunner import fixed_constants
+from workrunner.fixed_constants import constant_ascii_matches, constant_buffer, constant_bytes, constant_text
 
 
 class FixedConstantTests(unittest.TestCase):
@@ -27,3 +30,39 @@ class FixedConstantTests(unittest.TestCase):
         self.assertEqual(constant_text(b'#>K<'), 'abc')
         self.assertEqual(constant_bytes(b''), b'')
         self.assertEqual(constant_text(b''), '')
+
+    def test_native_word_buffers_are_cleared_after_use_and_on_error(self):
+        expected = bytes.fromhex('706561726c68617368')
+        with constant_buffer('legacyMethod') as value:
+            self.assertEqual(value, expected)
+        self.assertEqual(value, bytearray(len(expected)))
+        with self.assertRaisesRegex(RuntimeError, 'consumer failed'):
+            with constant_buffer('legacyMethod') as value:
+                self.assertEqual(value, expected)
+                raise RuntimeError('consumer failed')
+        self.assertEqual(value, bytearray(len(expected)))
+        self.assertTrue(constant_ascii_matches('legacyMethod', expected.decode('ascii')))
+        self.assertFalse(constant_ascii_matches('legacyMethod', 'unknown'))
+
+    def test_ascii_comparison_clears_buffers_for_matches_mismatches_and_errors(self):
+        buffers = []
+
+        @contextmanager
+        def observe(encoded):
+            with constant_buffer(encoded) as buffer:
+                buffers.append(buffer)
+                yield buffer
+
+        class BrokenText(str):
+            def __iter__(self):
+                raise RuntimeError('comparison failed')
+
+        with patch.object(fixed_constants, 'constant_buffer', observe):
+            self.assertTrue(constant_ascii_matches(b'#>K<', 'abc'))
+            for value in ('abd', 'ab', 'ab\u00e7', None, [], b'abc'):
+                self.assertFalse(constant_ascii_matches(b'#>K<', value))
+            self.assertTrue(constant_ascii_matches(b'', ''))
+            with self.assertRaisesRegex(RuntimeError, 'comparison failed'):
+                constant_ascii_matches(b'#>K<', BrokenText('abc'))
+        self.assertTrue(buffers)
+        self.assertTrue(all(not any(buffer) for buffer in buffers))

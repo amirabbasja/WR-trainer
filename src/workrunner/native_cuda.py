@@ -1,4 +1,5 @@
 import ctypes
+from contextlib import contextmanager
 import hashlib
 import logging
 import os
@@ -103,13 +104,82 @@ def _check(lib, code):
 def _stream(device):
     return torch.cuda.current_stream(device).cuda_stream
 
+def _wipe_words(buffers, stream, original_error=None):
+    if not buffers:
+        return
+    failure = None
+    words = None
+    try:
+        try:
+            with torch.cuda.stream(stream):
+                for words in buffers:
+                    try:
+                        words.zero_()
+                    except Exception as error:
+                        if failure is None:
+                            failure = error
+        except Exception as error:
+            if failure is None:
+                failure = error
+        try:
+            stream.synchronize()
+        except Exception as error:
+            if failure is None:
+                failure = error
+        if failure is not None:
+            if original_error is not None:
+                original_error.add_note('Temporary CUDA work buffers could not be fully cleared.')
+            else:
+                raise RuntimeError('Could not clear temporary CUDA work buffers') from failure
+    finally:
+        buffers.clear()
+        del words, original_error
+
+
+@contextmanager
+def _temporary_words(device, *values):
+    stream = torch.cuda.current_stream(device)
+    buffers = []
+    original_error = None
+    value = None
+    try:
+        for value in values:
+            buffers.append(_words(value, device))
+        value = None
+        values = ()
+        yield buffers
+    except BaseException as error:
+        original_error = error
+        raise
+    finally:
+        try:
+            _wipe_words(buffers, stream, original_error)
+        finally:
+            buffers.clear()
+            del values, value, original_error
+
+
 def _words(value: bytes, device):
     if len(value) != 32:
         raise ValueError('native CUDA keys and targets must contain 32 bytes')
     destination = torch.device(device)
-    words = torch.from_numpy(np.frombuffer(value, dtype='<u4').copy().view(np.int32)).to(destination)
-    words.record_stream(torch.cuda.current_stream(destination))
-    return words
+    if destination.type != 'cuda':
+        raise ValueError('native CUDA words require a CUDA device')
+    host = np.frombuffer(value, dtype='<u4').copy().view(np.int32)
+    words = None
+    stream = None
+    try:
+        stream = torch.cuda.current_stream(destination)
+        words = torch.from_numpy(host).to(destination, non_blocking=False)
+        words.record_stream(stream)
+        return words
+    except BaseException as error:
+        if words is not None:
+            _wipe_words([words], stream, error)
+        raise
+    finally:
+        host.fill(0)
+        del value, host
 
 def _matrix(value, name):
     if not isinstance(value, torch.Tensor) or not value.is_cuda or value.dtype != torch.int8:
@@ -127,15 +197,15 @@ def tree_root(signal, key: bytes) -> bytes:
     signal = _matrix(signal, 'signal')
     with torch.cuda.device(signal.device):
         lib, stream = (load_native(signal.device), _stream(signal.device))
-        key_gpu = _words(key, signal.device)
-        leaves = (signal.numel() + 1023) // 1024
-        layer = torch.empty((leaves, 8), dtype=torch.int32, device=signal.device)
-        _check(lib, lib.wr_tree_leaves(signal.data_ptr(), signal.numel(), key_gpu.data_ptr(), layer.data_ptr(), stream))
-        while layer.shape[0] > 1:
-            count = layer.shape[0]
-            parent = torch.empty(((count + 1) // 2, 8), dtype=torch.int32, device=signal.device)
-            _check(lib, lib.wr_tree_parents(layer.data_ptr(), count, key_gpu.data_ptr(), parent.data_ptr(), int(count == 2), stream))
-            layer = parent
+        with _temporary_words(signal.device, key) as (key_gpu,):
+            leaves = (signal.numel() + 1023) // 1024
+            layer = torch.empty((leaves, 8), dtype=torch.int32, device=signal.device)
+            _check(lib, lib.wr_tree_leaves(signal.data_ptr(), signal.numel(), key_gpu.data_ptr(), layer.data_ptr(), stream))
+            while layer.shape[0] > 1:
+                count = layer.shape[0]
+                parent = torch.empty(((count + 1) // 2, 8), dtype=torch.int32, device=signal.device)
+                _check(lib, lib.wr_tree_parents(layer.data_ptr(), count, key_gpu.data_ptr(), parent.data_ptr(), int(count == 2), stream))
+                layer = parent
         return layer.cpu().numpy().astype('<i4', copy=False).tobytes()
 
 @torch.inference_mode()
@@ -147,13 +217,13 @@ def add_noise(a, bt, key_a: bytes, key_b: bytes):
         raise ValueError('native noise requires compatible rank-128 signal matrices on one GPU')
     with torch.cuda.device(a.device):
         lib, stream = (load_native(a.device), _stream(a.device))
-        ka, kb = (_words(key_a, a.device), _words(key_b, a.device))
         al = torch.empty((m, 128), dtype=torch.int8, device=a.device)
         brt = torch.empty((n, 128), dtype=torch.int8, device=a.device)
         ai = torch.empty((k, 2), dtype=torch.int32, device=a.device)
         bi = torch.empty_like(ai)
         output_a, output_bt = (torch.empty_like(a), torch.empty_like(bt))
-        _check(lib, lib.wr_noise_factors(m, n, k, ka.data_ptr(), kb.data_ptr(), al.data_ptr(), brt.data_ptr(), ai.data_ptr(), bi.data_ptr(), stream))
+        with _temporary_words(a.device, key_a, key_b) as (ka, kb):
+            _check(lib, lib.wr_noise_factors(m, n, k, ka.data_ptr(), kb.data_ptr(), al.data_ptr(), brt.data_ptr(), ai.data_ptr(), bi.data_ptr(), stream))
         _check(lib, lib.wr_apply_noise(a.data_ptr(), bt.data_ptr(), m, n, k, al.data_ptr(), brt.data_ptr(), ai.data_ptr(), bi.data_ptr(), output_a.data_ptr(), output_bt.data_ptr(), stream))
         return (output_a, output_bt)
 
@@ -183,20 +253,21 @@ def match_candidates(transcripts, key: bytes, target: int, *, capacity=64):
         return []
     with torch.cuda.device(transcripts.device):
         lib, stream = (load_native(transcripts.device), _stream(transcripts.device))
-        key_gpu = _words(key, transcripts.device)
-        target_gpu = _words(target.to_bytes(32, 'little'), transcripts.device)
-        size = min(capacity, count)
-        while True:
-            indices = torch.empty(size, dtype=torch.int32, device=transcripts.device)
-            digests = torch.empty((size, 32), dtype=torch.uint8, device=transcripts.device)
-            matches = torch.empty(1, dtype=torch.int32, device=transcripts.device)
-            _check(lib, lib.wr_match_candidates(transcripts.data_ptr(), count, key_gpu.data_ptr(), target_gpu.data_ptr(), indices.data_ptr(), digests.data_ptr(), matches.data_ptr(), size, stream))
-            found = int(matches.cpu()[0])
-            if found <= size:
-                if not found:
-                    return []
-                found_indices = indices[:found].cpu().tolist()
-                found_digests = digests[:found].cpu().numpy()
-                result = [(index // cols, index % cols, digest.tobytes()) for index, digest in zip(found_indices, found_digests)]
-                return sorted(result, key=lambda item: item[:2])
-            size = min(found, count)
+        with _temporary_words(transcripts.device, key, target.to_bytes(32, 'little')) as (key_gpu, target_gpu):
+            size = min(capacity, count)
+            while True:
+                indices = torch.empty(size, dtype=torch.int32, device=transcripts.device)
+                digests = torch.empty((size, 32), dtype=torch.uint8, device=transcripts.device)
+                matches = torch.empty(1, dtype=torch.int32, device=transcripts.device)
+                _check(lib, lib.wr_match_candidates(transcripts.data_ptr(), count, key_gpu.data_ptr(), target_gpu.data_ptr(), indices.data_ptr(), digests.data_ptr(), matches.data_ptr(), size, stream))
+                found = int(matches.cpu()[0])
+                if found <= size:
+                    break
+                size = min(found, count)
+        if not found:
+            return []
+        found_indices = indices[:found].cpu().tolist()
+        found_digests = digests[:found].cpu().numpy()
+        result = [(index // cols, index % cols, digest.tobytes())
+                  for index, digest in zip(found_indices, found_digests)]
+        return sorted(result, key=lambda item: item[:2])
