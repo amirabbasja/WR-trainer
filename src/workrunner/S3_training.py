@@ -31,9 +31,9 @@ _LOG_RESULT_FAILED = FixedAlias('training.log.batch_submission_rejected')
 _LOG_STOPPED = FixedAlias('training.log.training_run_summary')
 
 LOG = logging.getLogger(wire.LOGGER_NAME)
-TRAINING_REPORT_INTERVAL = 120.0
-TRAINING_STARTUP_REPORT_INTERVAL = 10.0
-TRAINING_STARTUP_REPORT_WINDOW = 120.0
+TRAINING_REPORT_INTERVAL = 10.0
+TRAINING_STARTUP_REPORT_INTERVAL = 2.0
+TRAINING_STARTUP_REPORT_WINDOW = 15.0
 
 @dataclass
 class S3TrainingStats:
@@ -267,11 +267,9 @@ def _run_S3_training(configuration, *, login_only, login_config, stopped, effort
                     vpn_guard.attach(session)
                 with session:
                     log(logging.INFO, constant_text(_LOG_CONNECTED), S3['host'], S3['port'], 'gzip' if session.negotiated_gzip else 'none')
-                    report_connection_started = time.monotonic()
-                    report_started = report_connection_started
-                    reported_work = False
+                    first_work_report = last_work_report = None
                     if selected_protocol == 'WR' and (not login_only):
-                        report_gpu(session, report_started)
+                        report_gpu(session, time.monotonic())
                     previous_generation = None
                     previous_effort = None
                     job_deadline = time.monotonic() + S3['read_timeout']
@@ -337,11 +335,14 @@ def _run_S3_training(configuration, *, login_only, login_config, stopped, effort
                             stats.attempts += cfg.m // cfg.tile_h * (cfg.n // cfg.tile_w)
                             if selected_protocol == 'WR':
                                 now = time.monotonic()
-                                interval = TRAINING_STARTUP_REPORT_INTERVAL if now - report_connection_started < TRAINING_STARTUP_REPORT_WINDOW else TRAINING_REPORT_INTERVAL
-                                if not reported_work or now - report_started >= interval:
+                                if first_work_report is None:
+                                    first_work_report = now
+                                interval = (TRAINING_STARTUP_REPORT_INTERVAL
+                                            if now - first_work_report < TRAINING_STARTUP_REPORT_WINDOW
+                                            else TRAINING_REPORT_INTERVAL)
+                                if last_work_report is None or now - last_work_report >= interval:
                                     report_gpu(session, now)
-                                    report_started = now
-                                    reported_work = True
+                                    last_work_report = now
                             for row, col, digest in matches:
                                 if cancelled():
                                     stats.outdated += 1
