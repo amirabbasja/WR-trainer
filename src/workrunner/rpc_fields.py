@@ -7,12 +7,20 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_serializer, model_validator
 
-from .word_codec import decode_word, encode_word
+from .native_text_codec import decode_word, encode_word
 from .wire_io import WireError, WireLimitError, dumps_buffer, loads, read_json_body
 
 
 _name_policy = ContextVar('rpc_field_name_policy', default=(None, None))
 _extra_policy = ContextVar('rpc_field_extra_policy', default=None)
+_native_direction = ContextVar('rpc_native_field_direction', default=None)
+
+# Standalone models use training names for these native fields.
+_NATIVE_FIELDS = {
+    'training_credit': 'reward_amount',
+    'training_metadata': 'reward_metadata',
+}
+_TRAINING_FIELDS = {value: name for name, value in _NATIVE_FIELDS.items()}
 
 
 def _validate_with_policy(method, value, options):
@@ -33,7 +41,14 @@ def _neutral_fields(value, fields, allow_alias, allow_name, deferred=None):
     try:
         for name, item in value.items():
             if isinstance(name, str):
-                candidate = encode_word(name) if allow_alias else name
+                if allow_alias:
+                    candidate = encode_word(name)
+                    if candidate not in fields:
+                        candidate = _TRAINING_FIELDS.get(candidate, candidate)
+                elif _native_direction.get() == 'read' and name not in fields:
+                    candidate = _TRAINING_FIELDS.get(name, name)
+                else:
+                    candidate = name
                 if candidate != name and candidate in fields:
                     aliases[candidate] = item
                     continue
@@ -127,7 +142,11 @@ class WireModel(BaseModel):
                     'type': 'json_invalid', 'loc': (), 'input': None,
                     'ctx': {'error': 'Invalid JSON message'},
                 }]) from None
-            return cls.model_validate(neutral, by_alias=False, by_name=True, **options)
+            token = _native_direction.set('read')
+            try:
+                return cls.model_validate(neutral, by_alias=False, by_name=True, **options)
+            finally:
+                _native_direction.reset(token)
         finally:
             if isinstance(neutral, (dict, list)):
                 neutral.clear()
@@ -148,7 +167,11 @@ class WireModel(BaseModel):
                 raise ValueError('wire_buffer cannot serialize shadowing extra fields')
             options['by_alias'] = False
             options.setdefault('mode', 'json')
-            neutral = self.model_dump(**options)
+            token = _native_direction.set('write')
+            try:
+                neutral = self.model_dump(**options)
+            finally:
+                _native_direction.reset(token)
             with dumps_buffer(neutral, profile='rpc') as buffer:
                 try:
                     yield buffer
@@ -219,6 +242,12 @@ class WireModel(BaseModel):
             if by_alias is None:
                 by_alias = self.model_config.get('serialize_by_alias', False)
             if not by_alias or not self._wire_fields or not isinstance(values, dict):
+                if _native_direction.get() == 'write' and self._wire_fields and isinstance(values, dict):
+                    translated = {
+                        _NATIVE_FIELDS.get(name, name) if name in self._wire_fields else name: item
+                        for name, item in values.items()
+                    }
+                    return translated
                 return values
             extras = (self.__pydantic_extra__ or {}) if self.model_config.get('extra') == 'allow' else {}
             shadowed = {name: values[name] for name in self._wire_fields if name in extras and name in values}
@@ -230,7 +259,7 @@ class WireModel(BaseModel):
                 values = handler(copy_model)
             translated = {}
             for name, item in values.items():
-                key = decode_word(name) if name in self._wire_fields else name
+                key = decode_word(_NATIVE_FIELDS.get(name, name)) if name in self._wire_fields else name
                 translated[key] = item
             translated.update(shadowed)
             return translated

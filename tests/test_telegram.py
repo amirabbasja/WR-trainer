@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from workrunner.config import ConfigError, DEFAULT_CONFIG, load_config, save_config
-from workrunner.network import SocksProxy, routed
+from workrunner.socks_proxy import SocksProxy, routed
 from workrunner.telegram import TelegramUpdates
 
 

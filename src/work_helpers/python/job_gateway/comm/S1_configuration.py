@@ -1,4 +1,4 @@
-from workrunner.primitives import S1Configuration, MMAType, MoEConfig, PeriodicPattern
+from workrunner.protocol_types import S1Configuration, MMAType, MoEConfig, PeriodicPattern
 
 class WorkConfigurationFactory:
 

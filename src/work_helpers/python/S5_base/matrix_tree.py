@@ -1,6 +1,6 @@
 import torch
 from S5_utils import get_logger
-from workrunner.primitives import TREE_LEAF_SIZE, TreeProof, DigestTree, pad_to_chunk_boundary
+from workrunner.protocol_types import TREE_LEAF_SIZE, TreeProof, DigestTree, pad_to_chunk_boundary
 _LOGGER = get_logger(__name__)
 
 class MatrixTree:

@@ -2,7 +2,7 @@ import struct
 import unittest
 
 from workrunner.stream_digest import StreamDigest
-from workrunner.noise_domains import certificate_salt, noise_draw, tensor_domain
+from workrunner.noise_bounds import certificate_salt, noise_draw, tensor_domain
 
 
 class NoiseDomainTests(unittest.TestCase):

@@ -24,6 +24,15 @@ class ConfigSchemeTests(unittest.TestCase):
         self.values["training"]["output_dir"] = "results"
         self.values["side_job"]["repo_url"] = "https://huggingface.co/datasets/fixture/thesis"
 
+    def test_legacy_node_address_is_dropped_when_loading_and_saving(self):
+        self.values["node"]["address"] = "legacy-value"
+        self.path.write_text(json.dumps(self.values))
+
+        self.assertNotIn("address", read_config(self.path)["node"])
+        self.assertNotIn("address", load_config(self.path)["node"])
+        save_config(self.path, self.values)
+        self.assertNotIn("address", json.loads(self.path.read_text())["node"])
+
     def test_only_s3_encrypted_and_no_env_or_key_file_created(self):
         original = copy.deepcopy(self.values)
         save_config(self.path, self.values)

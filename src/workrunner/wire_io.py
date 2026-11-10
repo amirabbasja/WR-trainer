@@ -11,7 +11,7 @@ import json
 import secrets
 import threading
 
-from .word_codec import library_path
+from .native_text_codec import library_path
 
 
 class WireError(ValueError):

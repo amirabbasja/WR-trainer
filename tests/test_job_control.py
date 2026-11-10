@@ -2,21 +2,21 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from workrunner import job_control
-from workrunner.effort import JobSequence
-from workrunner.network import SocksProxy
+from workrunner import vpn_session_guard
+from workrunner.duty_cycle import JobSequence
+from workrunner.socks_proxy import SocksProxy
 from workrunner.vpn import VPNError
 
 
 class JobEventsTests(unittest.TestCase):
     def setUp(self):
         self.now = 100.0
-        clock = patch.object(job_control.time, "monotonic", side_effect=lambda: self.now)
+        clock = patch.object(vpn_session_guard.time, "monotonic", side_effect=lambda: self.now)
         clock.start()
         self.addCleanup(clock.stop)
         self.schedule = JobSequence([{"title": 'job-0', "time": 10, "max_gpu_utilization": 80}, {"title": 'job-1', "time": 20, "max_gpu_utilization": 70}, {"title": 'job-0', "time": 5, "max_gpu_utilization": 60}], started=100)
         self.updates = Mock()
-        self.events = job_control.JobEvents(self.schedule, self.updates)
+        self.events = vpn_session_guard.JobEvents(self.schedule, self.updates)
 
     def test_start_finish_and_role_changes_are_emitted_once(self):
         self.events.update()
@@ -40,7 +40,7 @@ class JobEventsTests(unittest.TestCase):
 
     def test_exit_finishes_active_job_without_starting_another(self):
         schedule = JobSequence([{"title": 'job-0', "time": 10, "max_gpu_utilization": 80}, {"title": 'job-0', "time": 0, "max_gpu_utilization": -1}], started=100)
-        events = job_control.JobEvents(schedule, self.updates)
+        events = vpn_session_guard.JobEvents(schedule, self.updates)
         events.update()
         self.now = 110
         events.update()
@@ -53,7 +53,7 @@ class JobEventsTests(unittest.TestCase):
 class VPNJobGuardTests(unittest.TestCase):
     def setUp(self):
         self.now = 100.0
-        clock = patch.object(job_control.time, "monotonic", side_effect=lambda: self.now)
+        clock = patch.object(vpn_session_guard.time, "monotonic", side_effect=lambda: self.now)
         clock.start()
         self.addCleanup(clock.stop)
         self.schedule = JobSequence([{"title": 'job-0', "time": 10, "max_gpu_utilization": 80}, {"title": 'job-1', "time": 20, "max_gpu_utilization": 70}, {"title": 'job-0', "time": 5, "max_gpu_utilization": 60}], started=100)
@@ -65,12 +65,12 @@ class VPNJobGuardTests(unittest.TestCase):
 
     def guard(self, *, proxy=True, enabled=True):
         config = {"vpn": dict(self.config["vpn"], enabled=enabled)}
-        with patch.object(job_control, "current_proxy", return_value=self.proxy if proxy else None), \
-                patch.object(job_control, "current_vpn", return_value=self.manager):
-            return job_control.VPNJobGuard(self.schedule, config, self.updates)
+        with patch.object(vpn_session_guard, "current_proxy", return_value=self.proxy if proxy else None), \
+                patch.object(vpn_session_guard, "current_vpn", return_value=self.manager):
+            return vpn_session_guard.VPNJobGuard(self.schedule, config, self.updates)
 
     def run_one_probe(self, guard, opener):
-        with patch.object(job_control, "http_opener", return_value=opener) as factory, \
+        with patch.object(vpn_session_guard, "http_opener", return_value=opener) as factory, \
                 patch.object(guard._stopped, "wait", side_effect=lambda _: guard._stopped.set()):
             guard._run()
         return factory

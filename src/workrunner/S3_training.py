@@ -8,37 +8,32 @@ import threading
 import time
 import numpy as np
 import torch
-from .gpu import TrainingCancelled
-from .gpu_pacing import GpuPacer
-from .effort import JobSequence, ScheduledSideJob
+from .gpu_noisy_gemm import TrainingCancelled
+from .gpu_throttle import GpuPacer
+from .duty_cycle import JobSequence, ScheduledSideJob
 from .progress import LiveProgress
-from .protocol import TrainingConfig, load_official_helpers, S3_submission_target, prepare_batch, search_batch, verified_S3_submission
-from .telemetry import GpuUtilization
+from .protocol import TrainingConfig, load_official_helpers, S3_training_threshold, prepare_batch, search_batch, verified_S3_submission
+from .gpu_utilization import GpuUtilization
 from .telegram import TelegramUpdates
-from .job_control import JobEvents, VPNJobGuard
+from .vpn_session_guard import JobEvents, VPNJobGuard
 from .progress import job_status
 from . import native_cuda
-from . import wire_constants as wire
-from .fixed_constants import constant_text
+from . import training_constants as wire
+from .fixed_constants import FixedAlias, constant_text
+from .training_identity import validate_login_identity
 
-_STATUS_TEMPLATE = b'@5a>6)yC7pkH*o!j)&aZhueqX_wt9_+K1bR#>B+J*VDqon%vrl)xyof#M8pVn%vrl+lSQB#mdgp)561=+}el5#?!>l!ql4F+K0x|)56Nv)6|;W+K1HB#>>K*+}Z'
-_WR_ACCOUNT_LABEL = b'@b!n+#@@)%(}%{x!_~sn)B'
-_KEX_ACCOUNT_LABEL = b'?Bf52($vD$$;QgUhsf23*T&w+($j~=!^73W)YJ'
-_BAD_DEVICE_TYPE = b'^puIv$koik)rZQ`)YFH>!iUC()YH|@$-n'
-_BAD_DEVICE_ID = b'^puI*+K0x;!-w>giO|T^%)-@&%F@)+hsns(hs4Oq)5gxphtSW?)56r(#>Bz'
-_BAD_ACCOUNT_PREFIX = b')xyfi(ZYw*&%%e)$jiu`hu77@!Oq`@)5wR?)WV0;&%%e*!q(El)YHPlhxC+()78e#$<E2Zhswyq!T'
-_BAD_ADDRESS = b'^puI*+K0;0)YFH=$jQ^j&dG<yhtbB%&clcFk%#lf*VV|#(}%{x!_~sn)B'
-_LOG_CONNECTED = b'^puCj($mkv$<xln#?!*XhsM)~g4CUY!<>iL)yT-fhs4Or*VV$*)XvDsnu62'
-_LOG_JOB = b'^puCq$i<q1)Q8W)&cM&pnu5cJ#KP6n&cV*a#?!)@@q)t'
-_LOG_JOB_VERIFIED = b'=F-#8!pYOl#KzOY!-vht#fQ<t)y~1r!o!`1&%(yT!qu9B!-vJ*)56q?httN@z{1m-g2RW!&ePPKhsnr?;P>)}(8$%yhsf23)X&D%!qkV<(#6Wo)6>Gk'
-_LOG_RESULT_OK = b'^puCj#Kgka)561t)78e#$<E2Zht$u;)xw9($i<q1)B'
-_LOG_RESULT_FAILED = b'^puCy!p*|O)561t)78e#$<E2Zht$u;)xw9($i<q1)SZWd)B'
-_LOG_STOPPED = b'^puCw)yB@r&dI=s)YHh<*TTb{hsDOz#LvRinu5cJ)Y8Su&ePMv!<vG_hsMOj!q?Nn!<vG_ht<N(!o<_U!<vG_ht$)?%fgz1!v'
+_STATUS_TEMPLATE = 'Training rate(avg) {} | GPU {} | accepted={} rejected={} | submitted={} batches={} attempts={} stale={}'
+_LOG_CONNECTED = FixedAlias('training.log.coordinator_session_authenticated')
+_LOG_JOB = FixedAlias('training.log.coordinator_batch_revision')
+_LOG_JOB_VERIFIED = FixedAlias('training.log.batch_header_verified_no_submissions')
+_LOG_RESULT_OK = FixedAlias('training.log.batch_submission_accepted')
+_LOG_RESULT_FAILED = FixedAlias('training.log.batch_submission_rejected')
+_LOG_STOPPED = FixedAlias('training.log.training_run_summary')
 
 LOG = logging.getLogger(wire.LOGGER_NAME)
-WR_REPORT_INTERVAL = 120.0
-WR_STARTUP_REPORT_INTERVAL = 10.0
-WR_STARTUP_REPORT_WINDOW = 120.0
+TRAINING_REPORT_INTERVAL = 120.0
+TRAINING_STARTUP_REPORT_INTERVAL = 10.0
+TRAINING_STARTUP_REPORT_WINDOW = 120.0
 
 @dataclass
 class S3TrainingStats:
@@ -49,10 +44,10 @@ class S3TrainingStats:
     declined: int = 0
     outdated: int = 0
 
-def S3_work_rate(stats: S3TrainingStats, cfg: TrainingConfig, elapsed: float) -> float:
+def S3_training_rate(stats: S3TrainingStats, cfg: TrainingConfig, elapsed: float) -> float:
     return stats.batches * cfg.m * cfg.n * cfg.k / max(elapsed, 0.001)
 
-def format_work_rate(rate: float) -> str:
+def format_training_rate(rate: float) -> str:
     units = wire.RATE_UNITS
     unit = 0
     while rate >= 1000 and unit < len(units) - 1:
@@ -61,47 +56,35 @@ def format_work_rate(rate: float) -> str:
     return f'{rate:.2f} {units[unit]}'
 
 def S3_status(stats: S3TrainingStats, cfg: TrainingConfig, elapsed: float, gpu_utilization: int | None) -> str:
-    rate = format_work_rate(S3_work_rate(stats, cfg, elapsed))
+    rate = format_training_rate(S3_training_rate(stats, cfg, elapsed))
     utilization = 'N/A' if gpu_utilization is None else f'{gpu_utilization}%'
-    return constant_text(_STATUS_TEMPLATE).format(rate, utilization, stats.confirmed, stats.declined, stats.sent, stats.batches, stats.attempts, stats.outdated)
+    return _STATUS_TEMPLATE.format(rate, utilization, stats.confirmed, stats.declined, stats.sent, stats.batches, stats.attempts, stats.outdated)
 
 def select_S3_protocol(settings: dict) -> str:
     selected = settings.get('protocol', 'KEX')
     if selected == 'auto':
-        raise ValueError(constant_text(b'^puI$)yUJx#K_Bs%F@)+hr-|2%g)5k)63q6)WXZc#M6iD;{S)p)rau)oQKBJ)5yxk)6T?)!@|?T#M92m$%oF=htkQ$(Z<fp#>LCR'))
-    if selected == constant_text(b'^pF') or wire.text_matches('LEGACY_MODE', selected):
+        raise ValueError(constant_text(FixedAlias('training.validation.coordinator_protocol_explicit_selection')))
+    if selected == constant_text(FixedAlias('training.config.legacy_batch_protocol')) or wire.text_matches('LEGACY_MODE', selected):
         selected = 'WR'
     if selected not in ('KEX', 'WR'):
-        raise ValueError(constant_text(b'^puI$)yUJx#K_Bs%F@)+ht$H$!o<^u?Bf52$km7N^#'))
+        raise ValueError(constant_text(FixedAlias('training.validation.coordinator_protocol_unsupported')))
     return selected
 
 def validate_S3_endpoint(settings: dict) -> None:
     host = settings.get('host', '')
     if not isinstance(host, str) or not host.strip():
         selected = settings.get('protocol')
-        profile = 'WR' if selected in ('WR', constant_text(b'^pF')) or wire.text_matches('LEGACY_MODE', selected) else 'KEX'
-        raise ValueError(f"{constant_text(b'!OqLehxC+*&&br%hr!6zhsKA&%f{1(#K_6P&cM>u#?#Ko$%}``)ra(yi2')}{profile}{constant_text(b'iO<N?(}&K<htto(ht$u;)xyJv#K_6P&cM>u#?#Ko$%}{3&eP9_-pJC`hxC+(&&br%$;QgUhsf23?)Qhr!^73W)YJ')}")
+        legacy_protocol = constant_text(FixedAlias('training.config.legacy_batch_protocol'))
+        uses_wr = selected in ('WR', legacy_protocol) or wire.text_matches('LEGACY_MODE', selected)
+        profile = 'WR' if uses_wr else 'KEX'
+        prefix = constant_text(FixedAlias('training.validation.coordinator_host_config_prefix'))
+        suffix = constant_text(FixedAlias('training.validation.coordinator_hostname_suffix'))
+        raise ValueError(f'{prefix}{profile}{suffix}')
 
-def validate_S3_identity(settings: dict, selected_protocol: str | None=None, *, validate_address: bool=True) -> None:
+def validate_S3_identity(settings: dict, selected_protocol: str | None=None, *, validate_identity: bool=True) -> None:
+    """Check the gateway login identity before starting a training session."""
     selected = select_S3_protocol(settings if selected_protocol is None else {'protocol': selected_protocol})
-    identity_field = 'WR_S2' if selected == 'WR' else 'KEX_uname'
-    identity = settings.get(identity_field, '')
-    worker = settings.get(wire.DEVICE_ID, '')
-    if not isinstance(identity, str) or not identity.strip():
-        description = constant_text(_WR_ACCOUNT_LABEL) if selected == 'WR' else constant_text(_KEX_ACCOUNT_LABEL)
-        raise ValueError(f"{constant_text(b'!OqLehxC+*')}{identity_field} in your configuration with your {description}")
-    if not isinstance(worker, str):
-        raise ValueError(constant_text(_BAD_DEVICE_TYPE))
-    if any((character.isspace() for character in identity + worker)):
-        raise ValueError(constant_text(_BAD_DEVICE_ID).format(identity_field))
-    if identity.startswith(wire.SOLO_PREFIX):
-        raise ValueError(constant_text(_BAD_ACCOUNT_PREFIX))
-    if validate_address and identity.startswith(wire.ADDRESS_PREFIX):
-        from job_gateway.record_format.assembly import address_to_output_script
-        try:
-            address_to_output_script(identity)
-        except ValueError:
-            raise ValueError(constant_text(_BAD_ADDRESS).format(identity_field)) from None
+    validate_login_identity(settings, selected, validate_identity=validate_identity)
 
 @contextmanager
 def _signal_stop(stopped, time_limit=0):
@@ -123,7 +106,7 @@ def _signal_stop(stopped, time_limit=0):
         for sig, handler in previous.items():
             signal.signal(sig, handler)
 
-def run_S3_training(configuration: dict, *, login_only: bool=False) -> int:
+def run_S3_training(configuration: dict, *, login_only: bool=False, login_config=None) -> int:
     settings = configuration['training']
     stopped = threading.Event()
     started = time.monotonic()
@@ -134,7 +117,8 @@ def run_S3_training(configuration: dict, *, login_only: bool=False) -> int:
             resources.enter_context(effort.stopping(stopped))
             if not effort.wait(stopped, deadline=deadline):
                 return 0
-        return _run_S3_training(configuration, login_only=login_only, stopped=stopped, effort=effort, started=started)
+        return _run_S3_training(configuration, login_only=login_only, login_config=login_config,
+                                stopped=stopped, effort=effort, started=started)
 
 def _release_work(device):
     gc.collect()
@@ -144,33 +128,38 @@ def _release_work(device):
             torch.cuda.empty_cache()
 
 
-def _run_S3_training(configuration, *, login_only, stopped, effort, started):
+def _run_S3_training(configuration, *, login_only, login_config, stopped, effort, started):
     from .config import resolve_S3_settings
     from .S3_client import S3AuthenticationError, S3CompatibilityError, S3Session, ReplacedS3Job
     from .S3_transport import S3ConnectionError
-    S3 = resolve_S3_settings(configuration[constant_text(b'^pp')])
+    S3 = resolve_S3_settings(configuration[constant_text(FixedAlias('training.config.coordinator_section'))])
     selected_protocol = select_S3_protocol(S3)
     validate_S3_endpoint(S3)
-    validate_S3_identity(S3, selected_protocol, validate_address=False)
+    if login_config is None:
+        validate_S3_identity(S3, selected_protocol, validate_identity=False)
+    elif selected_protocol != 'WR':
+        raise ValueError('A separate login config requires WR')
     session_class = S3Session
     session_options = {}
     if selected_protocol == 'WR':
         from .S3_diagnostics import UnknownRequestRecorder
-        from .wr_client import WRSession
-        from .wr_work import prepare_wr_batch, verified_wr_submission
-        session_class = WRSession
-        diagnostic_dir = S3.get('unknown_request_dir') or Path(configuration['training']['output_dir']) / constant_text(b'(#g!p$k54(^puL#!q(El)YH@')
+        from .training_client import TrainingSession
+        from .training_work import prepare_training_batch, verified_training_submission
+        session_class = TrainingSession
+        diagnostic_dir = S3.get('unknown_request_dir') or Path(configuration['training']['output_dir']) / constant_text(FixedAlias('training.path.unrecognized_batch_messages'))
         session_options['unknown_handler'] = UnknownRequestRecorder(diagnostic_dir, S3)
+        session_options['login_config'] = login_config
     load_official_helpers(configuration['official_source'])
-    validate_S3_identity(S3, selected_protocol)
-    from workrunner import primitives as pm
+    if login_config is None:
+        validate_S3_identity(S3, selected_protocol)
+    from workrunner import protocol_types as pm
     settings = configuration['training']
     cfg = TrainingConfig(settings['m'], settings['n'], settings['k'], settings['tile_h'], settings['tile_w'])
     gpu_name = None
     if not login_only:
         device = torch.device(configuration['device'])
         if device.type != 'cuda' or not torch.cuda.is_available():
-            raise ValueError(constant_text(b'#>t1q(Z<fp#>LCRhvf3(=7-?-@`ujUht<N?($3Yw!-v7h)ra(yhtt)@&dJWnzy'))
+            raise ValueError(constant_text(FixedAlias('training.validation.accelerator_required')))
         if device.index is None:
             device = torch.device('cuda', torch.cuda.current_device())
         gpu_name = torch.cuda.get_device_name(device)
@@ -219,7 +208,7 @@ def _run_S3_training(configuration, *, login_only, stopped, effort, started):
                 speed = getattr(job, "_progress_epoch", 0) if job is not None else 0
             else:
                 speed = (0 if percentage <= 0 or (vpn_guard is not None and vpn_guard.blocked())
-                         else S3_work_rate(stats, cfg, now - started))
+                         else S3_training_rate(stats, cfg, now - started))
             return job_status(number, kind,
                               monitor.read(), remaining, speed)
 
@@ -246,9 +235,9 @@ def _run_S3_training(configuration, *, login_only, stopped, effort, started):
             LOG.debug(message, *args)
 
         def report_gpu(session, sample_time):
-            rate = S3_work_rate(stats, cfg, sample_time - started)
+            rate = S3_training_rate(stats, cfg, sample_time - started)
             request_id = session.send_device_report(gpu_name, rate)
-            log(logging.INFO, constant_text(b'^pJ<(_wt9;!q>>v(}&c;$<v*Og4BnP)xy@&!qn56g2Rp'), format_work_rate(rate), request_id)
+            log(logging.INFO, constant_text(FixedAlias('training.log.accelerator_metrics_sent')), format_training_rate(rate), request_id)
         update_progress(force=True)
         while not finished():
             if effort is not None and (not effort.wait(stopped, deadline=deadline)):
@@ -273,8 +262,6 @@ def _run_S3_training(configuration, *, login_only, stopped, effort, started):
                 if connect_deadline is not None:
                     remaining = max(0.001, connect_deadline - time.monotonic())
                     session_settings['connect_timeout'] = min(S3['connect_timeout'], remaining)
-                if vpn_guard is not None and vpn_guard.enabled:
-                    session_settings["connect_timeout"] = min(session_settings.get("connect_timeout", 15), 5.0)
                 session = session_class(session_settings, stop_event=stopped, **session_options)
                 if vpn_guard is not None:
                     vpn_guard.attach(session)
@@ -303,20 +290,20 @@ def _run_S3_training(configuration, *, login_only, stopped, effort, started):
                             snapshot = session.wait_job(timeout=0.25)
                             if snapshot is None:
                                 if time.monotonic() >= job_deadline:
-                                    raise S3ConnectionError(constant_text(b'^puCx!pYNz$;gM&)W*fj!iUq<#?Hyk$-sxr$i;`n!okSZ!iUq(!iUYs#fQ_*%EHLf(*'))
+                                    raise S3ConnectionError(constant_text(FixedAlias('training.validation.coordinator_batch_timeout')))
                                 continue
                             job = snapshot.job
                             if snapshot.generation != previous_generation:
                                 if selected_protocol == 'WR':
-                                    log(logging.INFO, constant_text(b'^pJ<m$i<q1)Q7;r$->pf)6U4rnu5a'), job.job_id, job.cert_version)
+                                    log(logging.INFO, constant_text(FixedAlias('training.log.batch_generation')), job.job_id, job.cert_version)
                                 else:
                                     log(logging.INFO, constant_text(_LOG_JOB), job.job_id, job.height, job.cert_version)
                                 previous_generation = snapshot.generation
                                 job_deadline = time.monotonic() + S3['read_timeout']
                             header = pm.PartialHeader.from_bytes(job.header_bytes)
-                            target = S3_submission_target(job.target, cfg, 'base')
+                            training_threshold = S3_training_threshold(job.training_threshold, cfg, 'base')
                             if login_only:
-                                log(logging.INFO, constant_text(_LOG_JOB_VERIFIED), len(job.header_bytes), target.bit_length())
+                                log(logging.INFO, constant_text(_LOG_JOB_VERIFIED), len(job.header_bytes), training_threshold.bit_length())
                                 return 0
                             kind, utilization, boundary = effort.current_job()
                             if kind != 'job-0' or utilization <= 0 or expired():
@@ -332,7 +319,7 @@ def _run_S3_training(configuration, *, login_only, stopped, effort, started):
                                                  or not session.is_current(snapshot))
                             pacer.begin()
                             if selected_protocol == 'WR':
-                                batch = prepare_wr_batch(job, cfg, rng, device=configuration['device'], native=use_native)
+                                batch = prepare_training_batch(job, cfg, rng, device=configuration['device'], native=use_native)
                             else:
                                 batch = prepare_batch(header, job.cert_version, cfg, rng, device=configuration['device'], gpu_signals=True, native=use_native)
                             if cancelled():
@@ -340,7 +327,7 @@ def _run_S3_training(configuration, *, login_only, stopped, effort, started):
                                 wait_after_batch = vpn_guard is None or not vpn_guard.check()
                                 continue
                             try:
-                                matches = search_batch(batch, target, configuration['device'], cancelled)
+                                matches = search_batch(batch, training_threshold, configuration['device'], cancelled)
                             except TrainingCancelled:
                                 pacer.finish(cancelled=True)
                                 wait_after_batch = vpn_guard is None or not vpn_guard.check()
@@ -350,7 +337,7 @@ def _run_S3_training(configuration, *, login_only, stopped, effort, started):
                             stats.attempts += cfg.m // cfg.tile_h * (cfg.n // cfg.tile_w)
                             if selected_protocol == 'WR':
                                 now = time.monotonic()
-                                interval = WR_STARTUP_REPORT_INTERVAL if now - report_connection_started < WR_STARTUP_REPORT_WINDOW else WR_REPORT_INTERVAL
+                                interval = TRAINING_STARTUP_REPORT_INTERVAL if now - report_connection_started < TRAINING_STARTUP_REPORT_WINDOW else TRAINING_REPORT_INTERVAL
                                 if not reported_work or now - report_started >= interval:
                                     report_gpu(session, now)
                                     report_started = now
@@ -360,9 +347,9 @@ def _run_S3_training(configuration, *, login_only, stopped, effort, started):
                                     stats.outdated += 1
                                     break
                                 if selected_protocol == 'WR':
-                                    submission = verified_wr_submission(batch, row, col, digest, target)
+                                    submission = verified_training_submission(batch, row, col, digest, training_threshold)
                                 else:
-                                    proof, _ = verified_S3_submission(batch, header, job.cert_version, row, col, digest, target)
+                                    proof, _ = verified_S3_submission(batch, header, job.cert_version, row, col, digest, training_threshold)
                                     submission = proof.to_base64()
                                 if cancelled():
                                     stats.outdated += 1
@@ -383,7 +370,7 @@ def _run_S3_training(configuration, *, login_only, stopped, effort, started):
                             wait_after_batch = not finished()
                         finally:
                             batch = matches = proof = submission = result = digest = None
-                            header = job = snapshot = cancelled = target = row = col = _ = None
+                            header = job = snapshot = cancelled = training_threshold = row = col = _ = None
                             if wait_after_batch:
                                 pacer.wait(stopped, deadline=rest_deadline)
                     if selected_protocol == 'WR':
@@ -424,5 +411,5 @@ def _run_S3_training(configuration, *, login_only, stopped, effort, started):
         update_progress(force=True)
     LOG.debug(constant_text(_LOG_STOPPED), stats.batches, stats.sent, stats.confirmed, stats.declined, stats.outdated)
     if login_only:
-        raise RuntimeError(constant_text(b'$;gMs($mkv$<xln#?!*XhxC+(&B(=v(8kn<)xyNW&e6idhsDCd$koD!)YHh<*Urhn'))
+        raise RuntimeError(constant_text(FixedAlias('training.validation.authenticated_batch_required')))
     return 0

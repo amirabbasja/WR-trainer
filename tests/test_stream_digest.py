@@ -287,10 +287,10 @@ class TreeWrapperTests(unittest.TestCase):
             native.assert_not_called()
 
     def test_python_tree_matches_fixed_three_leaf_root_and_proof(self):
-        from workrunner import hashing, primitives
+        from workrunner import hashing, protocol_types
 
         with patch.object(hashing, "_native", return_value=None):
-            tree = primitives.DigestTree(patterned(3072), KEY)
+            tree = protocol_types.DigestTree(patterned(3072), KEY)
             self.assertEqual(tree.root, expected(3072, "keyed_hash"))
             proof = tree.get_multileaf_proof([0, 2])
             self.assertTrue(proof.verify(KEY))
@@ -303,7 +303,7 @@ class TreeWrapperTests(unittest.TestCase):
 class DependencyIsolationTests(unittest.TestCase):
     def test_backend_imports_and_hashes_when_external_package_is_blocked(self):
         source = Path(backend.__file__).resolve().parent.parent
-        script = '''
+        payload = '''
 import importlib.abc
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -318,7 +318,7 @@ from workrunner.stream_digest import StreamDigest
 assert StreamDigest().hexdigest() == sys.argv[2]
 assert external_package not in sys.modules
 '''
-        result = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(source),
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", payload, str(source),
                                  expected(0, "hash").hex()],
                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

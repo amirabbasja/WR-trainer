@@ -5,7 +5,7 @@ import threading
 import time
 from urllib.request import Request
 
-from .network import current_proxy, http_opener
+from .socks_proxy import current_proxy, http_opener
 
 
 LOG = logging.getLogger("workrunner")

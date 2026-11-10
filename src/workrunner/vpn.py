@@ -16,7 +16,7 @@ import time
 from urllib.parse import parse_qsl, unquote, urlsplit
 from .string_codec import customDecoder
 from .paths import artifacts_dir, bundled_xray
-from .network import SocksProxy
+from .socks_proxy import SocksProxy
 
 class VPNError(RuntimeError):
     pass

@@ -1,8 +1,8 @@
 from __future__ import annotations
 from collections.abc import Iterable
-from .fixed_constants import constant_text
-from .wire_constants import local_seed_field
-from . import wire_constants as wire
+from .fixed_constants import FixedAlias, constant_text
+from .training_constants import local_seed_field
+from . import training_constants as wire
 
 def _i32(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
@@ -26,7 +26,31 @@ def _seed(value: bytes | str, name: str) -> str:
 def build_submission_request(request_id: int, *, local_seed: bytes | str, device_seed: bytes | str, m: int, n: int, k: int, rank: int, tile_h: int, tile_w: int, sb: int, a_rows: Iterable[int], b_cols: Iterable[int]) -> dict:
     if isinstance(request_id, bool) or not isinstance(request_id, int) or (not 0 <= request_id < 1 << 64):
         raise ValueError('request_id must be an unsigned 64-bit integer')
-    S5 = _seed(local_seed, wire.LOCAL_SEED)
-    worker = _seed(device_seed, wire.DEVICE_SEED)
-    params = {constant_text(b'#`x99(9{'): [_i32(value, constant_text(b'#`x99(A0;{$-~0m')) for value in a_rows], constant_text(b'#rVX?%hU'): [_i32(value, constant_text(b'#rVX?%hZR?$-~0m')) for value in b_cols], 'k': _i32(k, 'k'), 'm': _i32(m, 'm'), local_seed_field(): S5, 'n': _i32(n, 'n'), wire.SEED: S5, 'rank': _i32(rank, 'rank'), constant_text(b')Wr'): _i32(sb, constant_text(b')Wr')), constant_text(b')W!JM'): [], constant_text(b')5gxr_{zw`!T'): 1, constant_text(b')6UDn_|E'): _i32(tile_h, constant_text(b')6UDn_|E')), constant_text(b')6UDn_|O'): _i32(tile_w, constant_text(b')6UDn_|O')), wire.DEVICE_SEED: worker}
+    local_seed_hex = _seed(local_seed, 'local_seed')
+    device_seed_hex = _seed(device_seed, 'device_seed')
+    row_label = constant_text(FixedAlias('training.field.input_row_index_label'))
+    column_label = constant_text(FixedAlias('training.field.weight_column_index_label'))
+    baseline = constant_text(FixedAlias('training.field.signal_baseline'))
+    tile_height = constant_text(FixedAlias('training.field.matrix_tile_height'))
+    tile_width = constant_text(FixedAlias('training.field.matrix_tile_width'))
+    params = {
+        constant_text(FixedAlias('training.field.input_row_indices')): [
+            _i32(value, row_label) for value in a_rows
+        ],
+        constant_text(FixedAlias('training.field.weight_column_indices')): [
+            _i32(value, column_label) for value in b_cols
+        ],
+        'k': _i32(k, 'k'),
+        'm': _i32(m, 'm'),
+        local_seed_field(): local_seed_hex,
+        'n': _i32(n, 'n'),
+        wire.SEED: local_seed_hex,
+        'rank': _i32(rank, 'rank'),
+        baseline: _i32(sb, baseline),
+        constant_text(FixedAlias('training.field.signal_baseline_parameters')): [],
+        constant_text(FixedAlias('training.field.tensor_tail_mode')): 1,
+        tile_height: _i32(tile_h, tile_height),
+        tile_width: _i32(tile_w, tile_width),
+        wire.DEVICE_SEED: device_seed_hex,
+    }
     return {'id': request_id, 'method': wire.SEND_RESULT, 'params': [params]}

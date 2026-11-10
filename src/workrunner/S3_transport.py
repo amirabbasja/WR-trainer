@@ -6,7 +6,7 @@ import re
 import socket
 import ssl
 import threading
-from . import network
+from . import socks_proxy
 MAX_IO = 8 * 1024 * 1024
 _DNS_LABEL = re.compile('[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\Z')
 
@@ -65,7 +65,7 @@ class S3Transport:
         self.connect_timeout = _timeout(connect_timeout, 'connect')
         self.read_timeout = _timeout(read_timeout, 'read')
         self._socket: socket.socket | None = None
-        self._proxy = network.current_proxy()
+        self._proxy = socks_proxy.current_proxy()
         self._message_channels = {}
         self._message_lock = threading.Lock()
 
@@ -81,7 +81,7 @@ class S3Transport:
         return None
 
     def open(self) -> S3Transport:
-        if not isinstance(self._proxy, network.SocksProxy):
+        if not isinstance(self._proxy, socks_proxy.SocksProxy):
             raise S3ConnectionError('VPN SOCKS routing is required')
         if self._socket is not None:
             return self
@@ -93,7 +93,7 @@ class S3Transport:
                 raise S3ConnectionError('Could not load S3 certificate authorities') from None
         connection = None
         try:
-            connection = network.create_connection((self.host, self.port), timeout=self.connect_timeout, proxy=self._proxy)
+            connection = socks_proxy.create_connection((self.host, self.port), timeout=self.connect_timeout, proxy=self._proxy)
             if context is not None:
                 connection = context.wrap_socket(connection, server_hostname=self.host)
             connection.settimeout(self.read_timeout)
@@ -187,11 +187,12 @@ class S3Transport:
             raise S3ConnectionError('S3 connection is not open')
         return self._socket
 
-    def send(self, data: bytes) -> None:
+    def send(self, data: bytes | memoryview) -> None:
         try:
-            if not isinstance(data, bytes):
-                raise S3ConnectionError('S3 payload must be bytes')
-            if len(data) > MAX_IO:
+            if not isinstance(data, (bytes, memoryview)):
+                raise S3ConnectionError('S3 payload must be bytes or a buffer view')
+            size = data.nbytes if isinstance(data, memoryview) else len(data)
+            if size > MAX_IO:
                 raise S3ConnectionError(f'S3 payload exceeds {MAX_IO} bytes')
             connection = self._connected()
             try:

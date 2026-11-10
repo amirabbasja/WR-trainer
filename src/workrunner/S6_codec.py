@@ -1,9 +1,11 @@
 from __future__ import annotations
 import json
 import secrets
-from .fixed_constants import constant_buffer, constant_bytes
+from .fixed_constants import FixedAlias, constant_buffer, constant_bytes
 
-_COEFFICIENTS = b'xy55QJPqK0oiX<c;Jn5Q#F49;{;BW&h2k0<jiRQbucW2KPq|Z}uA{6Bki@~<'
+_COEFFICIENTS = (
+    FixedAlias('training.format.batch_frame_coefficients')
+)
 
 
 def coefficients():

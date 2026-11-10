@@ -8,13 +8,13 @@ import re
 import tempfile
 from urllib.parse import urlsplit
 from .config_export import DEFAULT_DECRYPT_KEY, ExportError, decode_config_document, encode_config_document
-from .effort import normalize_job_sequence
+from .duty_cycle import normalize_job_sequence
 from .paths import artifacts_dir, resolve_helper_source
-from . import wire_constants as wire
-from .fixed_constants import constant_text
+from . import training_constants as wire
+from .fixed_constants import FixedAlias, constant_text
 
-_VERSION_FIELD_LABEL = b'+}er6!qwBx!Oq0S)57@C!qwEy$jJ'
-_INPUT_LIMIT = b')78e#$<E2Zhu77}$iaus$=A};)Q7^~#KOYEhxCzv)Q6LY>dxhd(8$%y!qtk-$=A};hs(~&&eH'
+_VERSION_FIELD_LABEL = FixedAlias('training.label.attestation_version_config_path')
+_INPUT_LIMIT = FixedAlias('training.validation.attestation_input_size_limit')
 
 
 class ConfigError(RuntimeError):
@@ -30,7 +30,7 @@ _S3_DEFAULTS = {'host': '', 'port': 7048, 'tls': False, 'ca_file': None, 'WR_S2'
 _S3_PROFILES = ('KEX', 'WR')
 def _s3_connection_fields():
     return {'host', 'port', 'tls', 'ca_file', 'compression', wire.FORMAT_SETTING, 'protocol_documentation'}
-_NODE_DEFAULTS = {'rpc_url': 'https://127.0.0.1:44107', 'username': '', 'password': '', 'ca_file': None, 'poll_interval': 2, 'refresh_interval': 15, 'rpc_timeout': 15, 'address': ''}
+_NODE_DEFAULTS = {'rpc_url': 'https://127.0.0.1:44107', 'username': '', 'password': '', 'ca_file': None, 'poll_interval': 2, 'refresh_interval': 15, 'rpc_timeout': 15}
 _VPN_DEFAULTS = {'enabled': True, 'link': '', 'core_path': None, 'startup_timeout': 10, 'links_file': 'links.txt', 'check_url': 'https://api.ipify.org'}
 _SIDE_JOB_DEFAULTS = {'repo_url': '', 'channels': [64, 128, 256, 512], 'blocks_per_stage': [2, 2, 2, 2], 'hidden_size': 512, 'image_size': 224, 'batch_size': 16, 'prefetch_batches': 2, 'passes_per_shard': 1, 'cache_limit_mb': 2048, 'learning_rate': 0.001, 'weight_decay': 0.0001, 'epochs': 0, 'use_amp': True, 'seed': 42, 'vpn': {'enabled': False, 'link': '', 'core_path': None, 'startup_timeout': 10}}
 DEFAULT_CONFIG = {'version': 1, 'mode': 'S3', 'official_source': 'src/work_helpers', 'device': 'cuda:0', 'training': copy.deepcopy(_TRAINING_DEFAULTS), 'S3': dict(_S3_DEFAULTS), 'node': dict(_NODE_DEFAULTS), 'vpn': dict(_VPN_DEFAULTS), 'side_job': copy.deepcopy(_SIDE_JOB_DEFAULTS), 'trainer_name': wire.DEFAULT_TITLE, 'telegram': dict(_TELEGRAM_DEFAULTS)}
@@ -393,9 +393,12 @@ def _validate_config(config, config_path) -> dict:
             _validate_S3_connection(profile, f'S3.{name}', directory)
             S3[name] = profile
     node = dict(_NODE_DEFAULTS)
-    node.update(_section(config.get('node', {}), set(node), 'node'))
+    raw_node = _section(config.get('node', {}), set(node) | {'address'}, 'node')
+    # Drop the obsolete key when reading or resaving older configs.
+    raw_node.pop('address', None)
+    node.update(raw_node)
     node['rpc_url'] = _http_url(node['rpc_url'], 'node.rpc_url')
-    for field in ('username', 'password', 'address'):
+    for field in ('username', 'password'):
         _string(node[field], f'node.{field}', controls=field == 'password')
     if ':' in node['username']:
         raise ConfigError('node.username must not contain a colon')

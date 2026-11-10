@@ -6,21 +6,21 @@ import numpy as np
 import torch
 from .stream_digest import StreamDigest
 from . import OFFICIAL_COMMIT
-from .gpu import RANK, gpu_add_sparse_noise, gpu_transcripts
-from .noise import generate_noise_factors, generate_sparse_noise_factors
-from .helpers import verify_bundle
+from .gpu_noisy_gemm import RANK, gpu_add_sparse_noise, gpu_transcripts
+from .noise_factors import generate_noise_factors, generate_sparse_noise_factors
+from .bundle_verify import verify_bundle
 from .paths import runtime_setting
-from .fixed_constants import constant_text
+from .fixed_constants import FixedAlias, constant_text
 
 _REFERENCE_COMPACT_LIMIT = 0x207FFFFF
-_ROOT_MISMATCH = b'$;Q*p(ZYw|_wtA8!qv>n!iUw!$kT_z&cVUL)zpW<)yT?+)6c?($iczR#LmXchvfJ2htt)<!T'
-_VERSION_ERROR = b'(#h1)*Vo9^)561t^pS_e!qwBx!Oq0S)53?*!qwEy$jOJn$km7Rl!w&M#?`_'
-_DIGEST_SIZE_ERROR = b';P>)})X&D%!iU4oz{1qihsx5_(}%^vhr-{+#M8^(hm@6v#op7x)B'
-_COORDINATE_ERROR = b'^puCx&&Jilhttl>!iU7j$koHn$;Q*d)Q8H_)YFH>!iUbu)55^Q)zk'
-_REFERENCE_TILE_ERROR = b'$iczR#LmXchvfJ2ht<Nt!qvjb#KMQy)yTur#KOae$;gMq$jaBt!qdWs)X&D%!iUq&%fb'
-_DIGEST_MISMATCH = b';P>)})X&D%!iU4oz{1qihr`an!NS$lhr!jz%7@d>!iUJg!Oq0a#><D~_wt9;!okAT!pX$K'
-_SUBMISSION_LIMIT_ERROR = b')78e#$<E2Zht$u;)xw9v$imcz$;i`(%EH3ahtto(hr-{+#M6iLl!w#C)xg5j'
-_VERIFICATION_ERROR = b'^puCx&&Jilht<N(!o<_U!-vJ*hseRf&cx2f%ZJgz)y~1r#KzOk$jP0D'
+_ROOT_MISMATCH = 'native GPU matrix tree root differs from the official CPU tree'
+_VERSION_ERROR = FixedAlias('training.validation.coordinator_submission_attestation_version')
+_DIGEST_SIZE_ERROR = FixedAlias('training.validation.accelerator_attestation_digest_length')
+_COORDINATE_ERROR = FixedAlias('training.validation.coordinator_tile_coordinates_type')
+_REFERENCE_TILE_ERROR = FixedAlias('training.validation.cpu_attestation_tile_incomplete')
+_DIGEST_MISMATCH = FixedAlias('training.validation.accelerator_reference_digest_mismatch')
+_SUBMISSION_LIMIT_ERROR = FixedAlias('training.validation.batch_submission_outside_acceptance_bound')
+_VERIFICATION_ERROR = FixedAlias('training.validation.coordinator_submission_verification_prefix')
 
 def load_official_helpers(source: str | Path) -> None:
     source = verify_bundle(source)
@@ -58,10 +58,10 @@ class TrainingConfig:
         if self.m % self.tile_h or self.n % self.tile_w:
             raise ValueError('m and n must be divisible by their tile dimensions')
         if (self.tile_h + self.tile_w) * self.k > 1 << 22:
-            raise ValueError(constant_text(b')WXZc#M8pVhu77}$iauz$k5b>#>vBn#K_Ci%E{D+!r#Qg!o!F3k$}{PlZWcg<%iJ7)y%@xiq6T`($j~_&dScy'))
+            raise ValueError(constant_text(FixedAlias('training.validation.attestation_selected_tile_size_limit')))
 
     def official_config(self):
-        from workrunner import primitives as pm
+        from workrunner import protocol_types as pm
         return pm.S1Configuration(common_dim=self.k, rank=RANK, mma_type=pm.MMAType.Int7xInt7ToInt32, rows_pattern=pm.PeriodicPattern.from_list(list(range(self.tile_h))), cols_pattern=pm.PeriodicPattern.from_list(list(range(self.tile_w))))
 
 @dataclass
@@ -78,7 +78,7 @@ class TrainingBatch:
     b_noised_t: torch.Tensor | None = None
 
     def plain_proof(self, tile_row: int, tile_col: int):
-        from workrunner import primitives as pm
+        from workrunner import protocol_types as pm
         cfg = self.config
         rows = list(range(tile_row * cfg.tile_h, (tile_row + 1) * cfg.tile_h))
         cols = list(range(tile_col * cfg.tile_w, (tile_col + 1) * cfg.tile_w))
@@ -101,12 +101,12 @@ class DeferredTree:
             from S5_base.matrix_tree import MatrixTree
             tree = MatrixTree(self.signal.cpu(), self.key)
             if tree.root != self.root:
-                raise RuntimeError(constant_text(_ROOT_MISMATCH))
+                raise RuntimeError(_ROOT_MISMATCH)
             self._tree = tree
         return self._tree
 
     def leaf_indices_from_rows(self, rows):
-        from workrunner import primitives as pm
+        from workrunner import protocol_types as pm
         return pm.DigestTree.compute_leaf_indices_from_rows(rows, tuple(self.signal.shape))
 
     def get_multileaf_proof(self, indices):
@@ -114,7 +114,7 @@ class DeferredTree:
 
 def prepare_batch(header, cert_version: int, config: TrainingConfig, rng: np.random.Generator, *, device: str | torch.device='cpu', gpu_signals: bool=False, native: bool=False) -> TrainingBatch:
     if cert_version not in (1, 2, 3):
-        raise ValueError(f"{constant_text(b'(#h1)*Vo9^)561t^pS_e!qwBx!Oq0S)53?*!qwEy$jOH')}{cert_version}")
+        raise ValueError(f"{constant_text(FixedAlias('training.validation.attestation_version_prefix'))}{cert_version}")
     destination = torch.device(device)
     if gpu_signals:
         if destination.type != 'cuda':
@@ -133,7 +133,7 @@ def prepare_signal_batch(header, cert_version: int, config: TrainingConfig, a: t
     from S5_base.commitment_hash import CommitmentHasher
     from S5_base.matrix_tree import MatrixTree
     if cert_version not in (1, 2, 3):
-        raise ValueError(f"{constant_text(b'(#h1)*Vo9^)561t^pS_e!qwBx!Oq0S)53?*!qwEy$jOH')}{cert_version}")
+        raise ValueError(f"{constant_text(FixedAlias('training.validation.attestation_version_prefix'))}{cert_version}")
     if not isinstance(a, torch.Tensor) or not isinstance(bt, torch.Tensor) or a.dtype != torch.int8 or (bt.dtype != torch.int8) or (a.ndim != 2) or (bt.ndim != 2) or (a.shape[1] != config.k) or (bt.shape[1] != config.k) or (a.shape[0] < config.m) or (bt.shape[0] < config.n):
         raise ValueError('signal matrices must cover the configured int8 training dimensions')
     destination = torch.device(device)
@@ -166,62 +166,62 @@ def prepare_signal_batch(header, cert_version: int, config: TrainingConfig, a: t
         b_noised = bt.T + (bl.to(torch.int32) @ br.to(torch.int32)).to(torch.int8)
     return TrainingBatch(config, a, bt, a_tree, b_tree, commitment, a_noised.contiguous(), b_noised.contiguous())
 
-def adjusted_target(base_target: int, config: TrainingConfig) -> int:
-    from workrunner import primitives as pm
-    if not 0 < base_target < 2 ** 256:
+def adjusted_training_threshold(base_training_threshold: int, config: TrainingConfig) -> int:
+    from workrunner import protocol_types as pm
+    if not 0 < base_training_threshold < 2 ** 256:
         raise ValueError('node target must be a positive 256-bit integer')
-    result = pm.penalized_target_bound(base_target, config.official_config())
+    result = pm.scaled_training_threshold(base_training_threshold, config.official_config())
     if result is None:
         raise ValueError('target scaling overflows; choose a harder test-network target')
     return result
 
-def matching_tiles(transcripts: np.ndarray, key: bytes, target: int):
-    if len(key) != 32 or not 0 <= target < 2 ** 256:
+def matching_tiles(transcripts: np.ndarray, key: bytes, training_threshold: int):
+    if len(key) != 32 or not 0 <= training_threshold < 2 ** 256:
         raise ValueError('invalid transcript hash key or target')
     for row in range(transcripts.shape[0]):
         for col in range(transcripts.shape[1]):
             message = transcripts[row, col].astype('<u4').tobytes()
             digest = StreamDigest(message, key=key).digest()
-            if int.from_bytes(digest, 'little') <= target:
+            if int.from_bytes(digest, 'little') <= training_threshold:
                 yield (row, col, digest)
 
-def search_batch(batch: TrainingBatch, target: int, device: str, cancelled=lambda: False):
+def search_batch(batch: TrainingBatch, training_threshold: int, device: str, cancelled=lambda: False):
     cfg = batch.config
     if batch.native and (cfg.tile_h, cfg.tile_w) == (8, 8):
         from . import native_cuda
-        from .gpu import TrainingCancelled
+        from .gpu_noisy_gemm import TrainingCancelled
         if cancelled():
             raise TrainingCancelled('training job cancelled')
         transcripts = native_cuda.transcripts_device(batch.a_noised, batch.b_noised_t)
         if cancelled():
             raise TrainingCancelled('training job cancelled')
-        matches = native_cuda.match_candidates(transcripts, batch.commitment.noise_seed_A, target)
+        matches = native_cuda.match_candidates(transcripts, batch.commitment.noise_seed_A, training_threshold)
         if cancelled():
             raise TrainingCancelled('training job cancelled')
         return iter(matches)
     transcripts = gpu_transcripts(batch.a_noised, batch.b_noised, cfg.tile_h, cfg.tile_w, device, cancelled)
-    return matching_tiles(transcripts, batch.commitment.noise_seed_A, target)
+    return matching_tiles(transcripts, batch.commitment.noise_seed_A, training_threshold)
 
-def S3_submission_target(target: int, config: TrainingConfig, target_kind: str='base') -> int:
-    if type(target) is not int or not 0 < target < 2 ** 256:
-        raise ValueError(constant_text(b'^puCw#?`>W(}&8^)YFH>!iUC(*T~e))6UVthn13%ip9>;htA2<!ob4S'))
-    if target_kind == 'base':
-        return adjusted_target(target, config)
-    if target_kind == 'final':
-        return target
-    raise ValueError(constant_text(b'^puCw#?`>W(}&E?$-{@r($v$3#lnZh#?-=x$km6z&dJ8h'))
+def S3_training_threshold(training_threshold: int, config: TrainingConfig, threshold_kind: str='base') -> int:
+    if type(training_threshold) is not int or not 0 < training_threshold < 2 ** 256:
+        raise ValueError(constant_text(FixedAlias('training.validation.coordinator_acceptance_bound_value')))
+    if threshold_kind == 'base':
+        return adjusted_training_threshold(training_threshold, config)
+    if threshold_kind == 'final':
+        return training_threshold
+    raise ValueError(constant_text(FixedAlias('training.validation.coordinator_acceptance_bound_kind')))
 
-def verified_S3_submission(batch: TrainingBatch, header, cert_version: int, row: int, col: int, gpu_digest: bytes, final_target: int):
+def verified_S3_submission(batch: TrainingBatch, header, cert_version: int, row: int, col: int, gpu_digest: bytes, training_threshold: int):
     import struct
     if type(cert_version) is not int or cert_version not in (1, 2, 3):
         raise ValueError(constant_text(_VERSION_ERROR))
     if not isinstance(gpu_digest, bytes) or len(gpu_digest) != 32:
         raise ValueError(constant_text(_DIGEST_SIZE_ERROR))
-    if type(final_target) is not int or not 0 < final_target < 2 ** 256:
-        raise ValueError(constant_text(b'!OqFX%ZK!ohttN@z{1mq%F@)+hsDB&#)sF))Xvk+(ZYw7l97tV&eMm^$<xBX!qo'))
+    if type(training_threshold) is not int or not 0 < training_threshold < 2 ** 256:
+        raise ValueError(constant_text(FixedAlias('training.validation.final_acceptance_bound_range')))
     if type(row) is not int or type(col) is not int:
         raise ValueError(constant_text(_COORDINATE_ERROR))
-    from workrunner import primitives as pm
+    from workrunner import protocol_types as pm
     from S5_base.noisy_gemm import NoisyGemm
     proof = batch.plain_proof(row, col)
     cfg = batch.config
@@ -234,7 +234,7 @@ def verified_S3_submission(batch: TrainingBatch, header, cert_version: int, row:
     digest = StreamDigest(message, key=batch.commitment.noise_seed_A).digest()
     if digest != gpu_digest:
         raise RuntimeError(constant_text(_DIGEST_MISMATCH))
-    if int.from_bytes(digest, 'little') > final_target:
+    if int.from_bytes(digest, 'little') > training_threshold:
         raise ValueError(constant_text(_SUBMISSION_LIMIT_ERROR))
     valid, message = pm.verify_plain_proof_for_cert_version(cert_version, header, proof, compact_limit_override=_REFERENCE_COMPACT_LIMIT)
     if not valid:

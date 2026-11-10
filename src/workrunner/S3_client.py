@@ -4,16 +4,16 @@ import math
 import threading
 import time
 from typing import Any
-from . import S3_methods as methods
-from .S3_protocol import KEXDialect, S3Job, S3ProtocolError
+from . import training_methods as methods
+from .S3_protocol import S3Dialect, S3Job, S3ProtocolError
 from .S3_transport import MAX_IO, S3ConnectionError, S3Transport
-from . import wire_constants as wire
-from .fixed_constants import constant_text, neutral_protocol_text
+from . import training_constants as wire
+from .fixed_constants import FixedAlias, constant_text, neutral_protocol_text
 
-_SEND_FAILED = b'^puCx&&Jilht$H!!-v7f&db8X'
-_ACK_TIMED_OUT = b'^puCx&&JilhsMOr$;i;l!o$GA%EHOhhttl=!o!Ei($f'
-_ACK_MISSING = b'^puCh%gEHi!-vJf!N}FZhsMOr$;i;l!o$GM$-sxx&%%e)&&Jil'
-_FAILED_RESULT = b'^puCy!p*|O)561t)X&D%!T'
+_SEND_FAILED = FixedAlias('training.validation.coordinator_submission_send_failed')
+_ACK_TIMED_OUT = FixedAlias('training.validation.coordinator_submission_acknowledgement_timeout')
+_ACK_MISSING = FixedAlias('training.validation.coordinator_closed_before_acknowledgement')
+_FAILED_RESULT = FixedAlias('training.validation.coordinator_submission_rejected')
 
 
 class S3AuthenticationError(S3ConnectionError):
@@ -43,13 +43,13 @@ class _Pending:
 
 def _seconds(value: float, *, allow_zero: bool=False) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(constant_text(b'^puCt#?I4+)6UAm$kNk?%F@)+hsDB&#)rYq$<EWlhsn~)#lqD'))
+        raise ValueError(constant_text(FixedAlias('training.validation.coordinator_wait_timeout_finite')))
     try:
         seconds = float(value)
     except OverflowError:
         seconds = math.inf
     if not math.isfinite(seconds) or seconds < 0 or (seconds == 0 and (not allow_zero)):
-        raise ValueError(constant_text(b'^puCt#?I4+)6UAm$kNk?%F@)+hsDB&#)sF))Xvk+(ZYwp&dJWx!iUMy%EiLf'))
+        raise ValueError(constant_text(FixedAlias('training.validation.coordinator_wait_timeout_positive')))
     return seconds
 
 
@@ -65,7 +65,7 @@ class S3Session:
         self.stop_event = stop_event if stop_event is not None else threading.Event()
         compression = self.settings.get('compression', 'none')
         if compression not in ('none', 'gzip'):
-            raise S3ProtocolError(constant_text(b'^puCh$jaB%!qn8x$jOJw($v$3#lnZl$jQQo$km6y-Okq'))
+            raise S3ProtocolError(constant_text(FixedAlias('training.validation.coordinator_compression_unsupported')))
         self.dialect = self._create_dialect()
         self.transport = S3Transport(host=self.settings['host'], port=self.settings['port'], tls=self.settings.get('tls', False), ca_file=self.settings.get('ca_file'), connect_timeout=self.settings.get('connect_timeout', 15), read_timeout=self.settings.get('read_timeout', 60))
         self._condition = threading.Condition()
@@ -83,8 +83,8 @@ class S3Session:
         self._reader: threading.Thread | None = None
         self._stop_watcher: threading.Thread | None = None
 
-    def _create_dialect(self) -> KEXDialect:
-        return KEXDialect(KEX_uname=self.settings.get('KEX_uname', ''), worker=self.settings.get(wire.DEVICE_ID, ''), password=self.settings.get('password', 'x'), **({'agent': self.settings['agent']} if 'agent' in self.settings else {}), request_gzip=self.settings.get('compression', 'none') == 'gzip')
+    def _create_dialect(self) -> S3Dialect:
+        return S3Dialect(session_identity=self.settings.get('KEX_uname', ''), worker=self.settings.get(wire.DEVICE_ID, ''), password=self.settings.get('password', 'x'), **({'agent': self.settings['agent']} if 'agent' in self.settings else {}), request_gzip=self.settings.get('compression', 'none') == 'gzip')
 
     @property
     def negotiated_gzip(self) -> bool:
@@ -95,7 +95,29 @@ class S3Session:
         if self._failure is not None:
             raise self._failure
         if self.stop_event.is_set() or self._closed_event.is_set():
-            raise S3ConnectionError(constant_text(b'^puCx!qn8x$jOJ!)Q8m5$k*4x!v'))
+            raise S3ConnectionError(constant_text(FixedAlias('training.validation.coordinator_session_already_stopped')))
+
+    def _start_auth_reader(self, auth_id: int, next_id: int) -> None:
+        self._auth_id = auth_id
+        self._next_id = next_id
+        self._reader = threading.Thread(target=self._read_loop, name=constant_text(FixedAlias('training.thread.batch_message_reader')), daemon=True)
+        self._stop_watcher = threading.Thread(target=self._watch_stop, name=constant_text(FixedAlias('training.thread.batch_session_stop_monitor')), daemon=True)
+        self._reader.start()
+        self._stop_watcher.start()
+
+    def _send_auth_requests(self) -> None:
+        requests = self.dialect.auth_requests(start_id=self._next_id)
+        try:
+            auth_id = next(r['id'] for r in requests if r['method'] == self.AUTH_METHOD)
+            self._start_auth_reader(auth_id, max(r['id'] for r in requests) + 1)
+            with self._send_lock:
+                for request in requests:
+                    try:
+                        self._send(request)
+                    finally:
+                        del request
+        finally:
+            del requests
 
     @neutral_protocol_text()
     def open(self) -> S3Session:
@@ -104,37 +126,22 @@ class S3Session:
             if self._authorized:
                 return self
             if self._opened:
-                raise S3ConnectionError(constant_text(b'^puCx!qn8x$jOJ!)Q85))xyTZ-iOH7!pY9bzy'))
+                raise S3ConnectionError(constant_text(FixedAlias('training.validation.coordinator_session_opening')))
             self._opened = True
         deadline = time.monotonic() + self.transport.connect_timeout
         try:
             self.transport.open()
-            requests = self.dialect.auth_requests(start_id=self._next_id)
-            try:
-                self._auth_id = next((r['id'] for r in requests if r['method'] == self.AUTH_METHOD))
-                self._next_id = max((r['id'] for r in requests)) + 1
-                self._reader = threading.Thread(target=self._read_loop, name=constant_text(b'@b!xHl#12D#>2wZ'), daemon=True)
-                self._stop_watcher = threading.Thread(target=self._watch_stop, name=constant_text(b'@b!xHl#0~T$kz'), daemon=True)
-                self._reader.start()
-                self._stop_watcher.start()
-                with self._send_lock:
-                    for request in requests:
-                        try:
-                            self._send(request)
-                        finally:
-                            del request
-            finally:
-                del requests
+            self._send_auth_requests()
             with self._condition:
                 while not self._authorized:
                     self._raise_failure()
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise S3ConnectionError(constant_text(b'^puCj($mkv$<xln#?#Ko$%oU<%EH5k$kNj'))
+                        raise S3ConnectionError(constant_text(FixedAlias('training.validation.coordinator_authentication_timeout')))
                     self._condition.wait(min(remaining, 0.1))
                 self._raise_failure()
             return self
-        except (S3ConnectionError, S3ProtocolError):
+        except BaseException:
             self.close()
             raise
 
@@ -160,22 +167,22 @@ class S3Session:
         self.transport.close()
 
     def close(self) -> None:
-        self._fail(S3ConnectionError(constant_text(b'^puCx!qn8x$jOJq%gEHi!v')))
+        self._fail(S3ConnectionError(constant_text(FixedAlias('training.validation.coordinator_session_closed'))))
         current = threading.current_thread()
         for thread in (self._reader, self._stop_watcher):
-            if thread is not None and thread is not current:
+            if thread is not None and thread.ident is not None and thread is not current:
                 thread.join(timeout=1)
 
     def _watch_stop(self) -> None:
         while not self._closed_event.wait(0.05):
             if self.stop_event.is_set():
-                self._fail(S3ConnectionError(constant_text(b'^puCx!qn8x$jOJ))5zD?!ov')))
+                self._fail(S3ConnectionError(constant_text(FixedAlias('training.validation.coordinator_session_stopped'))))
                 return
 
     @neutral_protocol_text()
     def _send(self, message: dict[str, Any]) -> None:
         try:
-            message = methods.s4_request(message)
+            message = methods.wire_request(message)
             try:
                 self.transport.send_message(message, profile="s3", max_frame=self.MAX_FRAME_BYTES)
             except (TypeError, ValueError, RecursionError):
@@ -208,7 +215,7 @@ class S3Session:
             if self._closed_event.is_set():
                 return
         method = response.get('method')
-        notification = methods.s4_notification_method(method)
+        notification = methods.notification_method(method)
         if notification == methods.WORK_UPDATE:
             job = self.dialect.parse_job(response.get('params'), self.settings.get(wire.FORMAT_SETTING))
             with self._condition:
@@ -220,7 +227,7 @@ class S3Session:
                     self._condition.notify_all()
             return
         if notification == methods.COMPUTE_RECONNECT:
-            self._fail(S3ConnectionError(constant_text(b'^puCy!q(El)YHPlht<Nw$jQmV#M92m$%oU(htto(hs4Oq!Op<a)xyJv!pXze$j-^r')))
+            self._fail(S3ConnectionError(constant_text(FixedAlias('training.validation.coordinator_reconnect_requested'))))
             return
         if method is not None:
             return
@@ -230,7 +237,7 @@ class S3Session:
         with self._condition:
             if request_id == self._auth_id and (not self._authorized):
                 if not self.dialect.accept(response):
-                    self._fail(S3AuthenticationError(constant_text(b'^puCy!p*|O)561t#?sTz!pYOl#KzOk$jJ')))
+                    self._fail(S3AuthenticationError(constant_text(FixedAlias('training.validation.coordinator_authentication_rejected'))))
                     return
                 self._negotiated_gzip = self.dialect.negotiate_gzip(response)
                 self._authorized = True
@@ -245,7 +252,7 @@ class S3Session:
         deadline = time.monotonic() + _seconds(timeout, allow_zero=True)
         with self._condition:
             if not self._opened:
-                raise S3ConnectionError(constant_text(b'^puCx!qn8x$jOJ!)Q8E)(}&2{!pQ'))
+                raise S3ConnectionError(constant_text(FixedAlias('training.validation.coordinator_session_not_open')))
             while True:
                 self._raise_failure()
                 if self._authorized and self._job is not None:
@@ -266,9 +273,9 @@ class S3Session:
             with self._condition:
                 self._raise_failure()
                 if not self.is_current(snapshot):
-                    raise ReplacedS3Job(constant_text(b'^puCy!q>~j#KOae)6dS-htt)@&dJWnz=zGq#fQbh!N}FZht$%=%Ffi(&dA9'))
+                    raise ReplacedS3Job(constant_text(FixedAlias('training.validation.batch_replaced_before_submission')))
                 if len(self._pending) >= self.MAX_PENDING_SUBMISSIONS:
-                    raise S3ConnectionError(constant_text(b'^T^1D%Ermwhu6Z%!_LXThxC+()Y8Su&eYV-$jQ_'))
+                    raise S3ConnectionError(constant_text(FixedAlias('training.validation.coordinator_pending_submission_limit')))
                 request_id = self._next_id
                 self._next_id += 1
                 negotiated = self._negotiated_gzip
@@ -278,7 +285,7 @@ class S3Session:
                 with self._condition:
                     self._raise_failure()
                     if not self.is_current(snapshot):
-                        raise ReplacedS3Job(constant_text(b'^puCy!q>~j#KOae)6dS-htt)@&dJWnz=zGq#fQbh!N}FZht$%=%Ffi(&dA9'))
+                        raise ReplacedS3Job(constant_text(FixedAlias('training.validation.batch_replaced_before_submission')))
                     self._pending[request_id] = pending
                 try:
                     self._send(request)

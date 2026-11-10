@@ -142,11 +142,13 @@ def run(root=None, *, login_only=False):
     set_checkout_directories(root)
     logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(message)s', stream=sys.stdout, force=True)
     try:
-        from workrunner.config import load_config, resolve_S3_settings
-        from workrunner.network import routed
-        from workrunner.S3_training import run_S3_training, validate_S3_endpoint, validate_S3_identity
+        from workrunner.config import resolve_S3_settings
+        from workrunner.login_config import load_training_config
+        from workrunner.socks_proxy import routed
+        from workrunner.S3_training import run_S3_training, validate_S3_endpoint
         from workrunner.vpn import ManagedVPN
-        config = load_config(root / 'config.json')
+        config_path = root / 'config.json'
+        config = load_training_config(config_path)
         if not login_only and config['training']['job_sequence'][0]['max_gpu_utilization'] == -1:
             return 0
         config['S3'] = resolve_S3_settings(config['S3'])
@@ -155,9 +157,8 @@ def run(root=None, *, login_only=False):
         if not config['vpn']['enabled'] or not config['vpn']['link']:
             raise ValueError('An enabled VPN link is required')
         validate_S3_endpoint(config['S3'])
-        validate_S3_identity(config['S3'], validate_address=False)
         with ManagedVPN(config['vpn']) as proxy, routed(proxy):
-            return run_S3_training(config, login_only=login_only)
+            return run_S3_training(config, login_only=login_only, login_config=config_path)
     except KeyboardInterrupt:
         print('Stopped', flush=True)
         return 130

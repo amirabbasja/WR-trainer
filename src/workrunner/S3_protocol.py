@@ -6,19 +6,19 @@ from dataclasses import dataclass
 import gzip
 import re
 from typing import Any
-from . import S3_methods as methods
-from . import wire_constants as wire
-from .fixed_constants import constant_text
+from . import training_methods as methods
+from . import training_constants as wire
+from .fixed_constants import FixedAlias, constant_text
 
-_VERSION_LABEL = b'#KP6n&cV*a#?!)w(Zbc#&dA9'
-_BAD_VERSION = b'(#h1)*Vo9^)561t^pS_e!qwBx!Oq0S)53?*!qwEy$jOJ?+5'
-_BAD_EVIDENCE = b'*UQGv$@tgR$jHHm%F@)+hsDB&$;ipV%GcB0hs4Io$jQ#c#><Dr#?-=*lK'
-_OVERSIZED_EVIDENCE = b'*UQGv$@tgR$jHHm!r#Qg!o$>u)6c?(lZWcg<%h$<#K^<K!-v$)-NJ{<&dScy'
-_OVERSIZED_THRESHOLD = b')5g`n!qbP!($v$3!Oqi%&dG<Bl97kS&ePN'
-_BAD_ACCOUNT = b'?Bf6U(#gik!iUDm!-vqw)y%@xhsx5_(}%>!$<xNp$%o0vhtSW?)56r(#>Bz'
-_BAD_THRESHOLD_TYPE = b')5g`n!qbP!($v$3#lnZihtI;_#>2wI&dSEiht$*6&dI<'
-_BAD_THRESHOLD_VALUE = b')5g`n!qbP!($v$3#lnZihu6r|&eP7(!iSZTk&4C6(}&N(-^Rnj#Lmjb%ZJp{)y~Pl'
-_NO_JOB_VERSION = b'&B(=v&eVs>&eYV-$-sxi!qwCG(Zbc#&dAA}hs4Oq!Op<a)xw9)(}%*}*UQet&eO}@hsf23($~Yr)53?-&%%fFlm'
+_VERSION_LABEL = FixedAlias('training.label.attestation_version')
+_BAD_VERSION = FixedAlias('training.validation.attestation_version_template')
+_BAD_EVIDENCE = FixedAlias('training.validation.dense_attestation_canonical_format')
+_OVERSIZED_EVIDENCE = FixedAlias('training.validation.dense_attestation_size_limit')
+_OVERSIZED_TRAINING_THRESHOLD = FixedAlias('training.validation.acceptance_bound_bit_length')
+_BAD_ACCOUNT = FixedAlias('training.validation.coordinator_worker_identity_whitespace')
+_INVALID_TRAINING_THRESHOLD_TYPE = FixedAlias('training.validation.acceptance_bound_hex_format')
+_INVALID_TRAINING_THRESHOLD_VALUE = FixedAlias('training.validation.acceptance_bound_positive_hex_range')
+_NO_JOB_VERSION = FixedAlias('training.validation.batch_attestation_revision_required')
 
 def s2():
     return wire.ACCOUNT
@@ -84,8 +84,8 @@ class S3Job:
     header_bytes: bytes
     height: int
     cert_version: int
-    target: int
-    raw_target: str | None = None
+    training_threshold: int
+    encoded_training_threshold: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.job_id, wire.JOB_ID, 128)
@@ -93,21 +93,21 @@ class S3Job:
             raise S3ProtocolError('header must contain exactly 76 bytes')
         _integer(self.height, 'height')
         _certificate(self.cert_version)
-        _integer(self.target, wire.THRESHOLD, 1)
-        if self.target >= 1 << 256:
-            raise S3ProtocolError(constant_text(_OVERSIZED_THRESHOLD))
+        _integer(self.training_threshold, wire.TRAINING_THRESHOLD, 1)
+        if self.training_threshold >= 1 << 256:
+            raise S3ProtocolError(constant_text(_OVERSIZED_TRAINING_THRESHOLD))
 
-class KEXDialect:
-    """Build neutral requests; S3Session applies the S3_methods wire mapping."""
+class S3Dialect:
+    """Build neutral requests; S3Session applies the training_methods wire mapping."""
 
     agent = _Agent()
 
-    def __init__(self, KEX_uname: str, worker: str, password: str='x', agent: str=_DEFAULT_AGENT, request_gzip: bool=False) -> None:
-        self.KEX_uname = _text(KEX_uname, 'KEX_uname', 256)
+    def __init__(self, session_identity: str, worker: str, password: str='x', agent: str=_DEFAULT_AGENT, request_gzip: bool=False) -> None:
+        self.session_identity = _text(session_identity, 'KEX_uname', 256)
         self.worker = _text(worker, wire.DEVICE_ID, 128, allow_empty=True)
         self.password = _text(password, 'password', 1024, allow_empty=True)
         self._agent = _DEFAULT_AGENT if agent is _DEFAULT_AGENT else _text(agent, 'agent', 128)
-        if any((c.isspace() for c in self.KEX_uname + self.worker)):
+        if any((c.isspace() for c in self.session_identity + self.worker)):
             raise S3ProtocolError(constant_text(_BAD_ACCOUNT))
         if type(request_gzip) is not bool:
             raise S3ProtocolError('request_gzip must be a boolean')
@@ -115,7 +115,7 @@ class KEXDialect:
 
     @property
     def login(self) -> str:
-        return f'{self.KEX_uname}.{self.worker}' if self.worker else self.KEX_uname
+        return f'{self.session_identity}.{self.worker}' if self.worker else self.session_identity
 
     def auth_requests(self, start_id: int=1) -> list[dict[str, Any]]:
         _integer(start_id, 'request ID', 1)
@@ -141,17 +141,17 @@ class KEXDialect:
         encoded_header = params.get('header')
         if not isinstance(encoded_header, str) or len(encoded_header) != 152 or _HEX.fullmatch(encoded_header) is None:
             raise S3ProtocolError('header must be exactly 152 hexadecimal characters')
-        raw_target = params.get(wire.THRESHOLD)
-        if not isinstance(raw_target, str):
-            raise S3ProtocolError(constant_text(_BAD_THRESHOLD_TYPE))
-        digits = raw_target[2:] if raw_target.startswith('0x') else raw_target
+        encoded_training_threshold = params.get(wire.TRAINING_THRESHOLD)
+        if not isinstance(encoded_training_threshold, str):
+            raise S3ProtocolError(constant_text(_INVALID_TRAINING_THRESHOLD_TYPE))
+        digits = encoded_training_threshold[2:] if encoded_training_threshold.startswith('0x') else encoded_training_threshold
         if not 1 <= len(digits) <= 64 or _HEX.fullmatch(digits) is None:
-            raise S3ProtocolError(constant_text(_BAD_THRESHOLD_VALUE))
-        target = int(digits, 16)
+            raise S3ProtocolError(constant_text(_INVALID_TRAINING_THRESHOLD_VALUE))
+        training_threshold = int(digits, 16)
         version = params.get(wire.FORMAT_FIELD, configured_certificate_version)
         if version is None:
             raise S3ProtocolError(constant_text(_NO_JOB_VERSION))
-        return S3Job(job_id=job_id, header_bytes=bytes.fromhex(encoded_header), height=_integer(params.get('height'), 'height'), cert_version=_certificate(version), target=target, raw_target=raw_target)
+        return S3Job(job_id=job_id, header_bytes=bytes.fromhex(encoded_header), height=_integer(params.get('height'), 'height'), cert_version=_certificate(version), training_threshold=training_threshold, encoded_training_threshold=encoded_training_threshold)
 
     def submission_request(self, job: S3Job, plain_proof_b64: str, request_id: int, negotiated_gzip: bool=False) -> dict[str, Any]:
         if not isinstance(job, S3Job):

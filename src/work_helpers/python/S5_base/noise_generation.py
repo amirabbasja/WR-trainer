@@ -1,4 +1,4 @@
-from workrunner.noise_domains import tensor_domain, noise_draw
+from workrunner.noise_bounds import tensor_domain, noise_draw
 from math import ceil
 import numpy as np
 import torch

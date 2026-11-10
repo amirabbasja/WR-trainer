@@ -1,9 +1,9 @@
 import torch
 from workrunner.stream_digest import StreamDigest
-from job_gateway.comm.dataclasses import CommitmentHash
-from workrunner.primitives import S1Configuration
-from workrunner.noise_domains import certificate_salt
-from workrunner.fixed_constants import constant_buffer
+from job_gateway.comm.training_types import CommitmentHash
+from workrunner.protocol_types import S1Configuration
+from workrunner.noise_bounds import certificate_salt
+from workrunner.fixed_constants import FixedAlias, constant_buffer
 from .matrix_tree import MatrixTree
 def seed_salt(label):
     return certificate_salt(StreamDigest, label)
@@ -14,11 +14,11 @@ def _bind_root(tree_root: bytes, dim: int, salt: bytes) -> bytes:
     return StreamDigest(tree_root + dim.to_bytes(4, 'little') + bytes(28), key=salt).digest()
 
 def bind_root_a(a_tree_root: bytes, m: int) -> bytes:
-    with constant_buffer(b'<^') as label:
+    with constant_buffer(FixedAlias('training.tensor.left_operand_label')) as label:
         return _bind_root(a_tree_root, m, seed_salt(label))
 
 def bind_root_b(b_tree_root: bytes, n: int) -> bytes:
-    with constant_buffer(b'<p') as label:
+    with constant_buffer(FixedAlias('training.tensor.right_operand_label')) as label:
         return _bind_root(b_tree_root, n, seed_salt(label))
 
 class CommitmentHasher:

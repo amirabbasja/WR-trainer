@@ -200,7 +200,7 @@ class NativeDeviceCleanupTests(unittest.TestCase):
 
     def test_candidate_keys_and_target_are_overwritten_after_capacity_retries(self):
         key = bytes(range(32))
-        target = (1 << 256) - 1
+        training_threshold = (1 << 256) - 1
         words = np.arange(3 * 5 * 16, dtype=np.uint32).reshape(3, 5, 16)
         expected = [
             (row, col, Digest(words[row, col].astype('<u4').tobytes(), key=key).digest())
@@ -209,12 +209,12 @@ class NativeDeviceCleanupTests(unittest.TestCase):
         stream = torch.cuda.Stream(device=self.device)
         with self.capture_words() as saved, torch.cuda.stream(stream):
             transcripts = torch.from_numpy(words.view(np.int32)).to(self.device)
-            actual = getattr(native_cuda, MATCH_FUNCTION)(transcripts, key, target, capacity=1)
+            actual = getattr(native_cuda, MATCH_FUNCTION)(transcripts, key, training_threshold, capacity=1)
         self.assertEqual(actual, expected)
         self.assert_wiped(saved, 2)
         np.testing.assert_array_equal(transcripts.cpu().numpy().view(np.uint32), words)
         self.assertEqual(key, bytes(range(32)))
-        self.assertEqual(target, (1 << 256) - 1)
+        self.assertEqual(training_threshold, (1 << 256) - 1)
 
     def test_candidate_no_match_return_still_overwrites_inputs(self):
         key = bytes(range(32))

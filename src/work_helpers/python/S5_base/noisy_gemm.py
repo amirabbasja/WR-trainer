@@ -1,17 +1,17 @@
-from workrunner.fixed_constants import constant_text
+from workrunner.fixed_constants import FixedAlias, constant_text
 import struct
 from workrunner.stream_digest import StreamDigest
 import numpy as np
 import torch
 from S5_utils import get_logger
-from job_gateway.comm.dataclasses import CommitmentHash, OpenedBlockInfo
+from job_gateway.comm.training_types import CommitmentHash, OpenedBlockInfo
 from job_gateway.comm.S1_configuration import PeriodicPattern
 from S5_base.matmul_config import MatmulConfig
 from .inner_hash import InnerHasher
 _LOGGER = get_logger(__name__)
 TRANSCRIPT_SIZE_U32 = 16
-WORK_LIMIT_HARDEST = 0
-WORK_LIMIT_EASIEST = 2 ** 256 - 1
+MIN_TRAINING_THRESHOLD = 0
+MAX_TRAINING_THRESHOLD = 2 ** 256 - 1
 HASH_ACCUMULATE_ROTATION = 13
 
 def rotl32(x: np.uint32, n: int) -> np.uint32:
@@ -127,15 +127,15 @@ class NoisyGemm:
             transcript = transcripts[hi][wi]
             transcript.rotl_xor_into(reduction_count, hash_result.hash)
 
-    def _check_work_limit(self, transcript: Transcript, work_key: bytes, work_limit: int) -> bool:
+    def _check_training_threshold(self, transcript: Transcript, validation_key: bytes, training_threshold: int) -> bool:
         transcript_bytes = b''.join((struct.pack('<I', int(w)) for w in transcript.data))
-        hash_result = StreamDigest(transcript_bytes, key=work_key).digest()
+        hash_result = StreamDigest(transcript_bytes, key=validation_key).digest()
         hash_int = int.from_bytes(hash_result, 'little')
-        return hash_int <= work_limit
+        return hash_int <= training_threshold
 
     def _record_opened_block(self, m: int, n: int) -> None:
         self.num_good_inner_hashes += 1
-        _LOGGER.debug(constant_text(b';mFd-!-vtv%g)1x#mmUV%!kI)hX') + f'm={m!r}, n={n!r}')
+        _LOGGER.debug(constant_text(FixedAlias('training.log.accepted_batch_tile_location')) + f'm={m!r}, n={n!r}')
         self.opened_block_info = OpenedBlockInfo(A_row_indices=list(range(m, m + self.hash_tile_h)), B_column_indices=list(range(n, n + self.hash_tile_w)), A=None, B_t=None, commitment_hash=None, noise_rank=self.noise_rank)
         _LOGGER.debug(f'A_row_indices={self.opened_block_info.A_row_indices}, B_column_indices={self.opened_block_info.B_column_indices}, ')
 
@@ -163,19 +163,19 @@ class NoisyGemm:
                 has_full_tiles = True
         return (C_block, has_full_tiles, transcripts)
 
-    def _check_tile_transcripts(self, transcripts: list[list[Transcript]], i: int, j: int, work_key: bytes, work_limit: int) -> bool:
+    def _check_tile_transcripts(self, transcripts: list[list[Transcript]], i: int, j: int, validation_key: bytes, training_threshold: int) -> bool:
         hash_tile_h = self.inner_hash.tile_h
         hash_tile_w = self.inner_hash.tile_w
         num_hash_tiles_h = len(transcripts)
         num_hash_tiles_w = len(transcripts[0]) if num_hash_tiles_h > 0 else 0
         for hi in range(num_hash_tiles_h):
             for wi in range(num_hash_tiles_w):
-                if self._check_work_limit(transcripts[hi][wi], work_key, work_limit):
+                if self._check_training_threshold(transcripts[hi][wi], validation_key, training_threshold):
                     self._record_opened_block(m=i + hi * hash_tile_h, n=j + wi * hash_tile_w)
                     return True
         return False
 
-    def _tiled_matmul(self, A: torch.Tensor, B: torch.Tensor, work_key: bytes, work_limit: int) -> tuple[torch.Tensor, bool]:
+    def _tiled_matmul(self, A: torch.Tensor, B: torch.Tensor, validation_key: bytes, training_threshold: int) -> tuple[torch.Tensor, bool]:
         assert A.shape[1] == B.shape[0]
         m, k = A.shape
         n = B.shape[1]
@@ -184,21 +184,21 @@ class NoisyGemm:
         hash_tile_w = self.inner_hash.tile_w
         if m < hash_tile_h or n < hash_tile_w or self.noise_rank < min(hash_tile_h, hash_tile_w):
             raise ValueError(f'm={m!r}, n={n!r}, hash_tile_h={hash_tile_h!r}, hash_tile_w={hash_tile_w!r}, self.noise_rank={self.noise_rank!r}, matmul tile should be larger than hash tile and noise rank')
-        found_record = False
+        batch_accepted = False
         for i in range(0, m, self.noise_rank):
             i_max = min(i + self.noise_rank, m)
             for j in range(0, n, self.noise_rank):
                 j_max = min(j + self.noise_rank, n)
                 C_block, has_full_tiles, transcripts = self._process_output_tile(A, B, k, i, i_max, j, j_max)
-                if not found_record and has_full_tiles:
-                    found_record = self._check_tile_transcripts(transcripts, i, j, work_key, work_limit)
+                if not batch_accepted and has_full_tiles:
+                    batch_accepted = self._check_tile_transcripts(transcripts, i, j, validation_key, training_threshold)
                 C[i:i_max, j:j_max] = C_block
-        return (C, found_record)
+        return (C, batch_accepted)
 
     def get_opened_block_info(self) -> OpenedBlockInfo | None:
         return self.opened_block_info
 
-    def gemm(self, A_noised: torch.Tensor, B_noised: torch.Tensor, E_AL: torch.Tensor, E_BR: torch.Tensor, A_E_BL: torch.Tensor, EAR_BpEB: torch.Tensor, work_key: bytes, work_limit: int) -> tuple[torch.Tensor, bool]:
+    def gemm(self, A_noised: torch.Tensor, B_noised: torch.Tensor, E_AL: torch.Tensor, E_BR: torch.Tensor, A_E_BL: torch.Tensor, EAR_BpEB: torch.Tensor, validation_key: bytes, training_threshold: int) -> tuple[torch.Tensor, bool]:
         if A_noised.dtype != torch.int8 or B_noised.dtype != torch.int8 or E_AL.dtype != torch.int8 or (E_BR.dtype != torch.int8) or (A_E_BL.dtype != torch.int32) or (EAR_BpEB.dtype != torch.int32):
             raise ValueError('Invalid dtypes: A_noised, B_noised, E_AL, E_BR, must be int8; A_E_BL, EAR_BpEB must be int32')
         if A_noised.shape[1] != B_noised.shape[0]:
@@ -211,11 +211,11 @@ class NoisyGemm:
             raise ValueError(f'E_AL.shape[1]={E_AL.shape[1]!r}, E_BR.shape[0]={E_BR.shape[0]!r}, A_E_BL.shape[1]={A_E_BL.shape[1]!r}, EAR_BpEB.shape[0]={EAR_BpEB.shape[0]!r}, expected shapes are E_AL: m x r, E_BR: r x n, A_E_BL: m x r, EAR_BpEB: r x n')
         A_EB = torch.matmul(A_E_BL, E_BR.to(torch.int32))
         EA_BpEB = torch.matmul(E_AL.to(torch.int32), EAR_BpEB)
-        C_noised, found_record = self._tiled_matmul(A_noised, B_noised, work_key, work_limit)
+        C_noised, batch_accepted = self._tiled_matmul(A_noised, B_noised, validation_key, training_threshold)
         C = C_noised - A_EB - EA_BpEB
-        return (C, found_record)
+        return (C, batch_accepted)
 
-    def noisy_gemm(self, A: torch.Tensor, B: torch.Tensor, E_AL: torch.Tensor, E_AR: torch.Tensor, E_BL: torch.Tensor, E_BR: torch.Tensor, commitment_hash: CommitmentHash, work_limit: int=WORK_LIMIT_HARDEST) -> tuple[torch.Tensor, bool]:
+    def noisy_gemm(self, A: torch.Tensor, B: torch.Tensor, E_AL: torch.Tensor, E_AR: torch.Tensor, E_BL: torch.Tensor, E_BR: torch.Tensor, commitment_hash: CommitmentHash, training_threshold: int=MIN_TRAINING_THRESHOLD) -> tuple[torch.Tensor, bool]:
         if A.dtype != torch.int8 or B.dtype != torch.int8 or E_AL.dtype != torch.int8 or (E_AR.dtype != torch.int8) or (E_BL.dtype != torch.int8) or (E_BR.dtype != torch.int8):
             raise ValueError('A, B, E_AL, E_AR, E_BL, E_BR must be int8')
         self.__validate_matrix_range(A)
@@ -230,16 +230,17 @@ class NoisyGemm:
             raise ValueError(f'E_AL.shape[1]={E_AL.shape[1]!r}, E_AR.shape[0]={E_AR.shape[0]!r}, E_BL.shape[1]={E_BL.shape[1]!r}, E_BR.shape[0]={E_BR.shape[0]!r}, expected shapes are E_AL: m x r, E_AR: r x k, E_BL: k x r, E_BR: r x n')
         if A.shape[0] < self.matmul_tile_h or A.shape[1] < self.noise_rank or B.shape[1] < self.matmul_tile_w:
             raise ValueError(f'A.shape[0]={A.shape[0]!r}, A.shape[1]={A.shape[1]!r}, B.shape[1]={B.shape[1]!r}, self.matmul_tile_h={self.matmul_tile_h!r}, self.noise_rank={self.noise_rank!r}, self.matmul_tile_w={self.matmul_tile_w!r}, expected A.shape[0] and A.shape[1] and B.shape[1] to be greater than matmul_tile_h and noise_rank and matmul_tile_w')
-        if not WORK_LIMIT_HARDEST <= work_limit <= WORK_LIMIT_EASIEST:
-            raise ValueError(constant_text(b'*T~TL)5g`n!qbP!($v$3#lnZq$%oU=!iUwy$-u&g*T~TL)5g`n!qb`') + f'{work_limit:#x} [{WORK_LIMIT_HARDEST:#x}, {WORK_LIMIT_EASIEST:#x}]')
+        if not MIN_TRAINING_THRESHOLD <= training_threshold <= MAX_TRAINING_THRESHOLD:
+            prefix = constant_text(FixedAlias('training.validation.acceptance_bound_interval_prefix'))
+            raise ValueError(f'{prefix}{training_threshold:#x} [{MIN_TRAINING_THRESHOLD:#x}, {MAX_TRAINING_THRESHOLD:#x}]')
         A_noised, A_E_BL = self.noise_A(A, E_AL, E_AR, E_BL)
         B_noised, EAR_BpEB = self.noise_B(B, E_AR, E_BL, E_BR)
-        result, found_record = self.gemm(A_noised, B_noised, E_AL, E_BR, A_E_BL, EAR_BpEB, commitment_hash.noise_seed_A, work_limit)
-        if found_record:
+        result, batch_accepted = self.gemm(A_noised, B_noised, E_AL, E_BR, A_E_BL, EAR_BpEB, commitment_hash.noise_seed_A, training_threshold)
+        if batch_accepted:
             assert self.opened_block_info.A is None
             assert self.opened_block_info.B_t is None
             assert self.opened_block_info.commitment_hash is None
             self.opened_block_info.commitment_hash = commitment_hash
             self.opened_block_info.A = A
             self.opened_block_info.B_t = B.T.contiguous()
-        return (result, found_record)
+        return (result, batch_accepted)

@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class TrainingControlTests(unittest.TestCase):
     def setUp(self):
-        spec = importlib.util.spec_from_file_location("wr_control_test", ROOT / "train.py")
+        spec = importlib.util.spec_from_file_location("training_control_test", ROOT / "train.py")
         self.trainer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.trainer)
         self.temporary = tempfile.TemporaryDirectory()
@@ -28,12 +28,12 @@ class TrainingControlTests(unittest.TestCase):
         self.addCleanup(self.trainer.stop_training)
         self.ready = Path(self.temporary.name) / "ready"
 
-    def start_script(self, script, **options):
+    def start_script(self, payload, **options):
 
         original_popen = subprocess.Popen
 
         def launch(_command, **kwargs):
-            return original_popen([sys.executable, "-u", "-c", script], **kwargs)
+            return original_popen([sys.executable, "-u", "-c", payload], **kwargs)
 
         with patch.object(self.trainer.subprocess, "Popen", side_effect=launch):
             return self.trainer.start(ROOT, **options)
@@ -214,7 +214,7 @@ class TrainingControlTests(unittest.TestCase):
     def test_closed_notebook_output_is_drained_until_explicit_stop(self):
         go = Path(self.temporary.name) / "go"
         drained = Path(self.temporary.name) / "drained"
-        script = (
+        payload = (
             "import signal, sys, time\n"
             "from pathlib import Path\n"
             "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
@@ -226,7 +226,7 @@ class TrainingControlTests(unittest.TestCase):
         )
         output = io.StringIO()
         with redirect_stdout(output):
-            process = self.start_script(script)
+            process = self.start_script(payload)
             self.wait_ready(process)
             output.close()
             go.write_text("go")
@@ -242,7 +242,7 @@ class TrainingControlTests(unittest.TestCase):
         "CUDA allocation check requires POSIX and PyTorch",
     )
     def test_stop_reaps_worker_holding_cuda_allocations(self):
-        script = (
+        payload = (
             "import signal, sys, time, torch\n"
             "from pathlib import Path\n"
             "if not torch.cuda.is_available():\n"
@@ -255,7 +255,7 @@ class TrainingControlTests(unittest.TestCase):
             "while True:\n"
             "    time.sleep(0.05)\n"
         )
-        process = self.start_script(script)
+        process = self.start_script(payload)
         deadline = time.monotonic() + 30
         while not self.ready.exists():
             code = process.poll()
