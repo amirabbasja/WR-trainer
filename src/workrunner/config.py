@@ -25,7 +25,7 @@ _TELEGRAM_DEFAULTS = {
     'training_stats_tgBot_key': '',
     'update_interval_seconds': 300,
 }
-_TRAINING_DEFAULTS = {'m': 256, 'n': 256, 'k': 2048, 'tile_h': 8, 'tile_w': 8, 'max_batches': 0, 'max_seconds': 0, 'job_sequence': [{"title": "job-0", "time": 60, "max_gpu_utilization": 80}, {"title": "job-0", "time": 120, "max_gpu_utilization": 70}, {"title": "job-0", "time": 180, "max_gpu_utilization": 10}], 'output_dir': str(artifacts_dir())}
+_TRAINING_DEFAULTS = {'m': 256, 'n': 256, 'k': 2048, 'tile_h': 8, 'tile_w': 8, 'max_batches': 0, 'max_seconds': 0, 'job_sequence': [{"title": "job-0", "time": 60, "max_gpu_utilization": 80}, {"title": "job-0", "time": 120, "max_gpu_utilization": 70}, {"title": "job-0", "time": 180, "max_gpu_utilization": 10}], 'output_dir': str(artifacts_dir()), 'generate_artifacts': True}
 _S3_DEFAULTS = {'host': '', 'port': 7048, 'tls': False, 'ca_file': None, 'WR_S2': '', 'KEX_uname': '', wire.DEVICE_ID: wire.DEFAULT_DEVICE, 'password': 'x', 'connect_timeout': 15, 'read_timeout': 60, 'reconnect_delay': 3, 'protocol': 'WR', 'compression': 'none', wire.FORMAT_SETTING: None, 'agent': wire.CLIENT_AGENT, 'stop_on_unknown_request': True, 'unknown_request_dir': None, 'protocol_documentation': None}
 _S3_PROFILES = ('KEX', 'WR')
 def _s3_connection_fields():
@@ -368,6 +368,8 @@ def _validate_config(config, config_path) -> dict:
         raise ConfigError(constant_text(_INPUT_LIMIT))
     _integer(training['max_batches'], 'training.max_batches', 0)
     _number(training['max_seconds'], 'training.max_seconds', zero=True)
+    if type(training['generate_artifacts']) is not bool:
+        raise ConfigError('training.generate_artifacts must be true or false')
     training['output_dir'] = _path(training['output_dir'], 'training.output_dir', directory)
     raw_S3 = _section(config.get('S3', {}), set(_S3_DEFAULTS) | set(_S3_PROFILES), 'S3')
     S3 = dict(_S3_DEFAULTS)

@@ -46,11 +46,12 @@ def job_status(job_number, job_title, gpu_percent, time_remaining, speed):
 
 class LiveProgress:
 
-    def __init__(self, stream=None, interval: float=1.0):
+    def __init__(self, stream=None, interval: float=1.0, *, enabled=True):
         if not isinstance(interval, (int, float)) or not math.isfinite(interval) or interval < 0:
             raise ValueError('progress interval must be finite and nonnegative')
         self.stream = sys.stderr if stream is None else stream
         self.interval = interval
+        self._enabled = enabled
         try:
             self._tty = bool(self.stream.isatty())
         except (AttributeError, OSError):
@@ -77,7 +78,7 @@ class LiveProgress:
 
     def update(self, text: str, force: bool=False) -> None:
         with self._lock:
-            if self._closed:
+            if self._closed or not self._enabled:
                 return
             self._latest_text = _plain_text(text)
             if self._latest_text == self._rendered_text and self._active:

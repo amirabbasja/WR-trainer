@@ -22,7 +22,7 @@ def _endpoint(settings):
 
 def _command(action, path, *args):
     return [
-        sys.executable, '-c',
+        sys.executable, '-B', '-c',
         'import sys; sys.path.insert(0, sys.argv.pop(1)); '
         'from workrunner.login_config import _main; raise SystemExit(_main(sys.argv[1:]))',
         str(Path(__file__).resolve().parents[1]), action, str(Path(path).resolve()), *args,

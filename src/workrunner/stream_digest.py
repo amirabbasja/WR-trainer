@@ -12,6 +12,7 @@ import threading
 
 from .paths import cache_dir
 from .string_codec import customDecoder
+from .training_artifacts import artifacts_enabled
 
 _IV = (0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
        0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19)
@@ -21,8 +22,12 @@ _MASK = 0xFFFFFFFF
 _BUILD_LOCK = threading.Lock()
 
 
-@lru_cache(maxsize=1)
 def _native():
+    return _load_native(artifacts_enabled())
+
+
+@lru_cache(maxsize=2)
+def _load_native(allow_build):
     compiler = shutil.which('c++')
     module = Path(__file__)
     source = module.with_name(module.stem + '_native.cpp')
@@ -32,9 +37,11 @@ def _native():
         with _BUILD_LOCK:
             identity = source.read_bytes() + platform.machine().encode() + platform.system().encode()
             folder = cache_dir() / 'hashing'
-            folder.mkdir(parents=True, exist_ok=True)
             library = folder / (module.stem + '-' + hashlib.sha256(identity).hexdigest()[:16] + '.so')
             if not library.is_file():
+                if not allow_build:
+                    return None
+                folder.mkdir(parents=True, exist_ok=True)
                 temporary = library.with_suffix(f'.{os.getpid()}.tmp.so')
                 try:
                     subprocess.run([compiler, '-O3', '-std=c++17', '-shared', '-fPIC',

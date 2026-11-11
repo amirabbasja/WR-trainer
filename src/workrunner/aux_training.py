@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import torch
 from torch import nn
+from .training_artifacts import training_output
 LOG = logging.getLogger('workrunner.aux_training')
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -85,9 +86,11 @@ class SideJob:
 
     def __init__(self, config, *, project_root=None, before_log=None):
         self.config = copy.deepcopy(config['side_job'])
+        self.generate_artifacts = config.get('training', {}).get('generate_artifacts', True)
         self.device = torch.device(config['device'])
         self.directory = Path(project_root or PROJECT_ROOT) / 'data' / 'side-job'
-        self.directory.mkdir(parents=True, exist_ok=True)
+        if self.generate_artifacts:
+            self.directory.mkdir(parents=True, exist_ok=True)
         self._stack = ExitStack()
         self.model = None
         self.optimizer = None
@@ -110,6 +113,8 @@ class SideJob:
         self.closed = False
 
     def _log(self, message, *args):
+        if not self.generate_artifacts:
+            return
         if self.before_log is not None:
             self.before_log()
         LOG.debug(message, *args)
@@ -173,7 +178,7 @@ class SideJob:
                 group['lr'] = self.config['learning_rate']
                 group['weight_decay'] = self.config['weight_decay']
             self._log('Resumed job-1 weights at epoch %d', self.epoch)
-        else:
+        elif self.generate_artifacts:
             save_checkpoint(self.directory, self._checkpoint(), rotate=False)
             self._log('Created new job-1 weights')
         self._progress_epoch = self.epoch + 1
@@ -200,12 +205,16 @@ class SideJob:
         self.examples = self.correct = 0
         self.total_loss = 0.0
         name = self.next_shard if self.next_shard in self.shards else self.shards[self.epoch % len(self.shards)]
-        self.shard_path = self.directory / 'train.parquet'
-        self.shard_path.unlink(missing_ok=True)
-        for partial in self.directory.glob('.shard-*.part'):
-            partial.unlink(missing_ok=True)
-        self.source.download_shard(name, self.shard_path, cancelled=cancelled)
-        dataset = ShardDataset(self.shard_path, image_size=self.config['image_size'], seed=self.config['seed'] + self.epoch, passes=self.config.get('passes_per_shard', 1), cache_limit_mb=self.config.get('cache_limit_mb', 2048))
+        if self.generate_artifacts:
+            self.shard_path = self.directory / 'train.parquet'
+            self.shard_path.unlink(missing_ok=True)
+            for partial in self.directory.glob('.shard-*.part'):
+                partial.unlink(missing_ok=True)
+            self.source.download_shard(name, self.shard_path, cancelled=cancelled)
+            shard = self.shard_path
+        else:
+            shard = self.source.read_shard(name, cancelled=cancelled)
+        dataset = ShardDataset(shard, image_size=self.config['image_size'], seed=self.config['seed'] + self.epoch, passes=self.config.get('passes_per_shard', 1), cache_limit_mb=self.config.get('cache_limit_mb', 2048))
         self.total_examples = len(dataset)
         self.total_batches = (self.total_examples + self.config['batch_size'] - 1) // self.config['batch_size']
         loader = torch.utils.data.DataLoader(dataset, batch_size=self.config['batch_size'], num_workers=0, pin_memory=True)
@@ -220,7 +229,8 @@ class SideJob:
         if not self.examples:
             raise RuntimeError('job-1 training shard is empty')
         self.epoch += 1
-        save_checkpoint(self.directory, self._checkpoint())
+        if self.generate_artifacts:
+            save_checkpoint(self.directory, self._checkpoint())
         self._progress_phase = 'Complete'
         self._log('job-1 epoch %d complete: loss=%.4f accuracy=%.1f%% examples=%d', self.epoch, self.total_loss / self.examples, 100 * self.correct / self.examples, self.examples)
         self._clear_shard()
@@ -313,21 +323,23 @@ def main(argv=None):
     parser.add_argument('--epochs', type=int, help='total completed epochs, including resumed epochs; 0 repeats')
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(message)s')
-    job = None
+    generate_artifacts = True
     try:
         config = load_training_config(args.config)
+        generate_artifacts = config['training']['generate_artifacts']
         if args.epochs is not None:
             if args.epochs < 0:
                 parser.error('--epochs must be nonnegative')
             config['side_job']['epochs'] = args.epochs
-        torch.set_num_threads(min(4, os.cpu_count() or 1))
-        with ExitStack() as resources:
+        with training_output(generate_artifacts), ExitStack() as resources:
+            torch.set_num_threads(min(4, os.cpu_count() or 1))
             telemetry_device = torch.device(config['device'])
             if telemetry_device.type == 'cuda' and telemetry_device.index is None:
                 telemetry_device = torch.device('cuda', torch.cuda.current_device())
             gpu = resources.enter_context(GpuUtilization(str(telemetry_device)))
-            progress = resources.enter_context(LiveProgress())
+            progress = resources.enter_context(LiveProgress(enabled=generate_artifacts))
             job = SideJob(config, before_log=progress.clear)
+            resources.callback(job.close)
 
             def snapshot():
                 return job_status(1, "job-1", gpu.read(), None, job._progress_epoch)
@@ -341,13 +353,12 @@ def main(argv=None):
             progress.update(snapshot(), force=True)
         return 0
     except KeyboardInterrupt:
-        LOG.debug('Stopped; the last completed epoch is saved')
+        if generate_artifacts:
+            LOG.debug('Stopped; the last completed epoch is saved')
         return 130
     except (ValueError, RuntimeError, OSError, ImportError) as exc:
-        LOG.error('%s', exc)
+        if generate_artifacts:
+            LOG.error('%s', exc)
         return 1
-    finally:
-        if job is not None:
-            job.close()
 if __name__ == '__main__':
     raise SystemExit(main())

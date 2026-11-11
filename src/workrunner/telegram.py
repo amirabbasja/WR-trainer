@@ -15,7 +15,8 @@ _REQUEST_TIMEOUT = 5.0
 class TelegramUpdates:
     def __init__(self, configuration, snapshot):
         settings = configuration.get("telegram", {})
-        self._enabled = settings.get("enabled", False)
+        self._enabled = (configuration.get("training", {}).get("generate_artifacts", True)
+                         and settings.get("enabled", False))
         self._name = configuration.get("trainer_name", "trainer")
         self._token = settings.get("tgBot_key", "")
         self._training_stats_token = settings.get("training_stats_tgBot_key", "")

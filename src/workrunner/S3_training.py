@@ -20,6 +20,7 @@ from .progress import job_status
 from . import native_cuda
 from . import training_constants as wire
 from .fixed_constants import FixedAlias, constant_text
+from .training_artifacts import training_output
 from .training_identity import validate_login_identity
 
 _STATUS_TEMPLATE = 'Training rate(avg) {} | GPU {} | accepted={} rejected={} | submitted={} batches={} attempts={} stale={}'
@@ -112,7 +113,7 @@ def run_S3_training(configuration: dict, *, login_only: bool=False, login_config
     started = time.monotonic()
     effort = None if login_only else JobSequence(settings['job_sequence'], started=started)
     deadline = started + settings['max_seconds'] if settings['max_seconds'] else None
-    with _signal_stop(stopped, settings['max_seconds']), ExitStack() as resources:
+    with training_output(settings.get('generate_artifacts', True)), _signal_stop(stopped, settings['max_seconds']), ExitStack() as resources:
         if effort is not None:
             resources.enter_context(effort.stopping(stopped))
             if not effort.wait(stopped, deadline=deadline):
@@ -141,19 +142,21 @@ def _run_S3_training(configuration, *, login_only, login_config, stopped, effort
         raise ValueError('A separate login config requires WR')
     session_class = S3Session
     session_options = {}
+    settings = configuration['training']
+    generate_artifacts = settings.get('generate_artifacts', True)
     if selected_protocol == 'WR':
-        from .S3_diagnostics import UnknownRequestRecorder
         from .training_client import TrainingSession
         from .training_work import prepare_training_batch, verified_training_submission
         session_class = TrainingSession
-        diagnostic_dir = S3.get('unknown_request_dir') or Path(configuration['training']['output_dir']) / constant_text(FixedAlias('training.path.unrecognized_batch_messages'))
-        session_options['unknown_handler'] = UnknownRequestRecorder(diagnostic_dir, S3)
+        if generate_artifacts:
+            from .S3_diagnostics import UnknownRequestRecorder
+            diagnostic_dir = S3.get('unknown_request_dir') or Path(settings['output_dir']) / constant_text(FixedAlias('training.path.unrecognized_batch_messages'))
+            session_options['unknown_handler'] = UnknownRequestRecorder(diagnostic_dir, S3)
         session_options['login_config'] = login_config
     load_official_helpers(configuration['official_source'])
     if login_config is None:
         validate_S3_identity(S3, selected_protocol)
     from workrunner import protocol_types as pm
-    settings = configuration['training']
     cfg = TrainingConfig(settings['m'], settings['n'], settings['k'], settings['tile_h'], settings['tile_w'])
     gpu_name = None
     if not login_only:
@@ -181,7 +184,7 @@ def _run_S3_training(configuration, *, login_only, login_config, stopped, effort
     def finished():
         return expired() or (max_batches > 0 and stats.batches >= max_batches)
     with ExitStack() as resources:
-        progress = resources.enter_context(LiveProgress())
+        progress = resources.enter_context(LiveProgress(enabled=generate_artifacts))
         monitor = None
         if not login_only:
             monitor = GpuUtilization(str(device)).start()

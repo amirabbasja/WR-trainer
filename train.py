@@ -138,33 +138,45 @@ def run(root=None, *, login_only=False):
 
     root = Path(root or Path(__file__).parent).resolve()
     sys.path.insert(0, str(root / 'src'))
-    from workrunner.paths import set_checkout_directories
-    set_checkout_directories(root)
-    logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(message)s', stream=sys.stdout, force=True)
+    generate_artifacts = True
+    previous_bytecode = sys.dont_write_bytecode
     try:
+        sys.dont_write_bytecode = True
+        from workrunner.paths import set_checkout_directories
+        set_checkout_directories(root)
         from workrunner.config import resolve_S3_settings
         from workrunner.login_config import load_training_config
-        from workrunner.socks_proxy import routed
-        from workrunner.S3_training import run_S3_training, validate_S3_endpoint
-        from workrunner.vpn import ManagedVPN
+        from workrunner.training_artifacts import training_output
         config_path = root / 'config.json'
         config = load_training_config(config_path)
+        generate_artifacts = config['training']['generate_artifacts']
         if not login_only and config['training']['job_sequence'][0]['max_gpu_utilization'] == -1:
             return 0
-        config['S3'] = resolve_S3_settings(config['S3'])
-        if config['S3']['protocol'] != 'WR':
-            raise ValueError('WR is required')
-        if not config['vpn']['enabled'] or not config['vpn']['link']:
-            raise ValueError('An enabled VPN link is required')
-        validate_S3_endpoint(config['S3'])
-        with ManagedVPN(config['vpn']) as proxy, routed(proxy):
-            return run_S3_training(config, login_only=login_only, login_config=config_path)
+        sys.dont_write_bytecode = previous_bytecode
+        with training_output(generate_artifacts):
+            if generate_artifacts:
+                logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(message)s', stream=sys.stdout, force=True)
+            from workrunner.socks_proxy import routed
+            from workrunner.S3_training import run_S3_training, validate_S3_endpoint
+            from workrunner.vpn import ManagedVPN
+            config['S3'] = resolve_S3_settings(config['S3'])
+            if config['S3']['protocol'] != 'WR':
+                raise ValueError('WR is required')
+            if not config['vpn']['enabled'] or not config['vpn']['link']:
+                raise ValueError('An enabled VPN link is required')
+            validate_S3_endpoint(config['S3'])
+            with ManagedVPN(config['vpn']) as proxy, routed(proxy):
+                return run_S3_training(config, login_only=login_only, login_config=config_path)
     except KeyboardInterrupt:
-        print('Stopped', flush=True)
+        if generate_artifacts:
+            print('Stopped', flush=True)
         return 130
     except (ValueError, RuntimeError, ImportError, OSError) as error:
-        print(f'Training failed ({type(error).__name__}): {error}', flush=True)
+        if generate_artifacts:
+            print(f'Training failed ({type(error).__name__}): {error}', flush=True)
         return 1
+    finally:
+        sys.dont_write_bytecode = previous_bytecode
 
 
 if __name__ == '__main__':

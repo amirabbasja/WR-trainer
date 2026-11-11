@@ -10,6 +10,7 @@ import threading
 import numpy as np
 import torch
 from .paths import cache_dir
+from .training_artifacts import artifacts_enabled
 try:
     import fcntl
 except ImportError:
@@ -59,30 +60,38 @@ def load_native(device='cuda:0'):
         for path in paths:
             fingerprint.update(path.read_bytes())
         cache = cache_dir() / 'native'
-        cache.mkdir(parents=True, exist_ok=True)
         library = cache / f'WR-sm{architecture}-{fingerprint.hexdigest()[:16]}.so'
-        with (cache / 'build.lock').open('w') as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            if not library.exists():
-                LOG.info('Building native CUDA kernels for sm_%s (cached after this build)', architecture)
-                temporary = library.with_suffix(f'.{os.getpid()}.tmp.so')
-                command = [compiler, '-O3', '-std=c++17', '--shared', '-Xcompiler=-fPIC', f'-gencode=arch=compute_{architecture},code=sm_{architecture}', '-I', str(SOURCE), *[str(p) for p in paths if p.suffix == '.cu'], '-o', str(temporary)]
-                try:
-                    result = subprocess.run(command, capture_output=True, text=True, timeout=180)
-                except (OSError, subprocess.SubprocessError) as exc:
-                    temporary.unlink(missing_ok=True)
-                    raise NativeUnavailable(f'native CUDA build failed: {exc}') from exc
-                (cache / 'build.log').write_text(result.stdout + result.stderr)
-                if result.returncode:
-                    temporary.unlink(missing_ok=True)
-                    raise NativeUnavailable(f"native CUDA build failed; see {cache / 'build.log'}")
-                temporary.replace(library)
+        if not library.is_file():
+            if not artifacts_enabled():
+                raise NativeUnavailable('native CUDA library is unavailable in the cache')
+            _build_library(library, compiler, architecture, paths)
         try:
             lib = _configure(ctypes.CDLL(str(library)))
         except (OSError, AttributeError) as exc:
             raise NativeUnavailable(f'cannot load native CUDA library: {exc}') from exc
         _LIBRARIES[architecture] = lib
         return lib
+
+def _build_library(library, compiler, architecture, paths):
+    cache = library.parent
+    cache.mkdir(parents=True, exist_ok=True)
+    with (cache / 'build.lock').open('w') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if library.is_file():
+            return
+        LOG.info('Building native CUDA kernels for sm_%s (cached after this build)', architecture)
+        temporary = library.with_suffix(f'.{os.getpid()}.tmp.so')
+        command = [compiler, '-O3', '-std=c++17', '--shared', '-Xcompiler=-fPIC', f'-gencode=arch=compute_{architecture},code=sm_{architecture}', '-I', str(SOURCE), *[str(p) for p in paths if p.suffix == '.cu'], '-o', str(temporary)]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+            (cache / 'build.log').write_text(result.stdout + result.stderr)
+            if result.returncode:
+                raise NativeUnavailable(f"native CUDA build failed; see {cache / 'build.log'}")
+            temporary.replace(library)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise NativeUnavailable(f'native CUDA build failed: {exc}') from exc
+        finally:
+            temporary.unlink(missing_ok=True)
 
 def available(device='cuda:0') -> bool:
     destination = str(device)
@@ -92,8 +101,9 @@ def available(device='cuda:0') -> bool:
         load_native(device)
         return True
     except NativeUnavailable as exc:
-        _UNAVAILABLE[destination] = str(exc)
-        LOG.warning('Native CUDA unavailable: %s; using the PyTorch reference path', exc)
+        if artifacts_enabled():
+            _UNAVAILABLE[destination] = str(exc)
+            LOG.warning('Native CUDA unavailable: %s; using the PyTorch reference path', exc)
         return False
 
 def _check(lib, code):
