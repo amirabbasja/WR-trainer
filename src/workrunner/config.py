@@ -25,7 +25,16 @@ _TELEGRAM_DEFAULTS = {
     'training_stats_tgBot_key': '',
     'update_interval_seconds': 300,
 }
-_TRAINING_DEFAULTS = {'m': 256, 'n': 256, 'k': 2048, 'tile_h': 8, 'tile_w': 8, 'max_batches': 0, 'max_seconds': 0, 'job_sequence': [{"title": "job-0", "time": 60, "max_gpu_utilization": 80}, {"title": "job-0", "time": 120, "max_gpu_utilization": 70}, {"title": "job-0", "time": 180, "max_gpu_utilization": 10}], 'output_dir': str(artifacts_dir()), 'generate_artifacts': True}
+_TRAINING_DEFAULTS = {
+    **dict(zip(('m', 'n', 'k', 'tile_h', 'tile_w'), wire.WR_CAPTURED_SHAPE)),
+    'max_batches': 0, 'max_seconds': 0,
+    'job_sequence': [
+        {'title': 'job-0', 'time': 60, 'max_gpu_utilization': 80},
+        {'title': 'job-0', 'time': 120, 'max_gpu_utilization': 70},
+        {'title': 'job-0', 'time': 180, 'max_gpu_utilization': 10},
+    ],
+    'output_dir': str(artifacts_dir()), 'generate_artifacts': True,
+}
 _S3_DEFAULTS = {'host': '', 'port': 7048, 'tls': False, 'ca_file': None, 'WR_S2': '', 'KEX_uname': '', wire.DEVICE_ID: wire.DEFAULT_DEVICE, 'password': 'x', 'connect_timeout': 15, 'read_timeout': 60, 'reconnect_delay': 3, 'protocol': 'WR', 'compression': 'none', wire.FORMAT_SETTING: None, 'agent': wire.CLIENT_AGENT, 'stop_on_unknown_request': True, 'unknown_request_dir': None, 'protocol_documentation': None}
 _S3_PROFILES = ('KEX', 'WR')
 def _s3_connection_fields():
@@ -80,6 +89,24 @@ def _number(value, field, *, zero=False):
         adjective = 'nonnegative' if zero else 'positive'
         raise ConfigError(f'{field} must be {adjective} and finite')
     return value
+
+def _device_selection(value):
+    if isinstance(value, str) and re.fullmatch(r'cuda(?::[0-9]+)?', value):
+        return value
+    if isinstance(value, list) and value:
+        devices = []
+        for item in value:
+            if type(item) is int and item >= 0:
+                index = item
+            elif isinstance(item, str) and re.fullmatch(r'cuda:(?:0|[1-9][0-9]{0,8})', item):
+                index = int(item[5:])
+            else:
+                raise ConfigError('device array entries must be CUDA indices or names like cuda:0')
+            devices.append(index)
+        if len(set(devices)) != len(devices):
+            raise ConfigError('device array must contain unique CUDA devices')
+        return devices
+    raise ConfigError('device must select CUDA, for example cuda:0 or [0, 1]')
 
 def _path(value, field, directory, *, optional=False):
     if optional and value is None:
@@ -327,9 +354,7 @@ def _validate_config(config, config_path) -> dict:
     mode = config.get('mode', 'S3')
     if mode != 'S3':
         raise ConfigError('configuration.mode must be S3')
-    device = _string(config.get('device', 'cuda:0'), 'device', nonempty=True)
-    if re.fullmatch('cuda(?::[0-9]+)?', device) is None:
-        raise ConfigError('device must select CUDA, for example cuda:0')
+    device = _device_selection(config.get('device', 'cuda:0'))
     directory = config_path.parent
     official_source = _path(config.get('official_source', 'src/work_helpers'), 'official_source', directory)
     official_source = resolve_helper_source(official_source, directory)
@@ -339,6 +364,9 @@ def _validate_config(config, config_path) -> dict:
     raw_training = _section(raw_training,
                             set(_TRAINING_DEFAULTS) | {'max_gpu_utilization'}, 'training')
     training = copy.deepcopy(_TRAINING_DEFAULTS)
+    # Older configs could specify only some dimensions and inherit the rest.
+    if raw_training.keys() & {'m', 'n', 'k', 'tile_h', 'tile_w'}:
+        training.update(m=256, n=256, k=2048, tile_h=8, tile_w=8)
     training.update({field: value for field, value in raw_training.items()
                      if field != 'max_gpu_utilization'})
     if 'max_gpu_utilization' in raw_training:
@@ -351,8 +379,10 @@ def _validate_config(config, config_path) -> dict:
         )
     except ValueError as exc:
         raise ConfigError(str(exc)) from None
-    for field in ('m', 'n'):
-        _integer(training[field], f'training.{field}', 128, 4096)
+    shape = tuple(training[field] for field in ('m', 'n', 'k', 'tile_h', 'tile_w'))
+    _integer(training['m'], 'training.m', 128, 4096)
+    max_n = wire.WR_CAPTURED_SHAPE[1] if shape == wire.WR_CAPTURED_SHAPE else 4096
+    _integer(training['n'], 'training.n', 128, max_n)
     _integer(training['k'], 'training.k', 2048, 65536)
     if training['k'] % 128:
         raise ConfigError('training.k must be a multiple of 128')

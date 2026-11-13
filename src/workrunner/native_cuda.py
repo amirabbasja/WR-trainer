@@ -238,15 +238,18 @@ def add_noise(a, bt, key_a: bytes, key_b: bytes):
         return (output_a, output_bt)
 
 @torch.inference_mode()
-def transcripts_device(a, bt, *, variant=0):
+def transcripts_device(a, bt, *, variant=0, tile_w=8):
     a, bt = (_matrix(a, 'a'), _matrix(bt, 'bt'))
     m, k = a.shape
     n, other_k = bt.shape
-    if k != other_k or k % 128 or k > 65536 or m % 8 or n % 8 or (a.device != bt.device):
-        raise ValueError('native transcripts require compatible 8x8 tiles and rank-128 slabs')
+    if tile_w == 16 and variant == 0:
+        variant = 8
+    if (tile_w not in (8, 16) or (variant == 8) != (tile_w == 16)
+            or k != other_k or k % 128 or k > 65536 or m % 8 or n % tile_w or a.device != bt.device):
+        raise ValueError('native transcripts require compatible 8x8 or 8x16 tiles and rank-128 slabs')
     with torch.cuda.device(a.device):
         lib, stream = (load_native(a.device), _stream(a.device))
-        output = torch.empty((m // 8, n // 8, 16), dtype=torch.int32, device=a.device)
+        output = torch.empty((m // 8, n // tile_w, 16), dtype=torch.int32, device=a.device)
         _check(lib, lib.wr_transcripts_i8(a.data_ptr(), bt.data_ptr(), m, n, k, output.data_ptr(), stream, variant))
         return output
 

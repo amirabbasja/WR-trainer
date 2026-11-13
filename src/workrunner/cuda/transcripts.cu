@@ -83,22 +83,22 @@ void launch(const int* a, const int* bt, int m, int n, int k,
     const dim3 grid((n + BN - 1) / BN, (m + BM - 1) / BM);
     transcripts_dp4a<BM, BN><<<grid, THREADS, 0, stream>>>(a, bt, m, n, k / 4, output);
 }
-template <int BM, int BN>
+template <int BM, int BN, int TW>
 __global__ void transcripts_dp4a_wide(const int* __restrict__ a,
                                       const int* __restrict__ bt,
                                       int m, int n, int k_words,
                                       uint32_t* __restrict__ output) {
     constexpr int GROUP = 2;
-    constexpr int THREADS = BM * BN / 32;
-    constexpr int COLS = 4;
+    constexpr int THREADS = BM * BN * GROUP / (8 * TW);
+    constexpr int COLS = TW / GROUP;
     constexpr int WORDS = 8;
     __shared__ int shared_a[BM][33];
     __shared__ int shared_b[BN][33];
     const int tid = threadIdx.x;
     const int lane = tid & (GROUP - 1);
     const int group = tid / GROUP;
-    const int tile_row = group / (BN / 8);
-    const int tile_col = group % (BN / 8);
+    const int tile_row = group / (BN / TW);
+    const int tile_col = group % (BN / TW);
     const int row_base = blockIdx.y * BM;
     const int col_base = blockIdx.x * BN;
     const int swizzle = (tile_col & 4) | ((tile_col & 8) >> 2);
@@ -126,7 +126,7 @@ __global__ void transcripts_dp4a_wide(const int* __restrict__ a,
             int bv[COLS];
             #pragma unroll
             for (int col = 0; col < COLS; ++col)
-                bv[col] = shared_b[tile_col * 8 + (col_first ^ (GROUP * col))][inner];
+                bv[col] = shared_b[tile_col * TW + (col_first ^ (GROUP * col))][inner];
             #pragma unroll
             for (int row = 0; row < 8; ++row) {
                 const int av = shared_a[tile_row * 8 + row][inner];
@@ -152,20 +152,20 @@ __global__ void transcripts_dp4a_wide(const int* __restrict__ a,
         __syncthreads();
     }
     const int output_row = row_base / 8 + tile_row;
-    const int output_col = col_base / 8 + tile_col;
-    if (output_row < m / 8 && output_col < n / 8) {
-        uint32_t* destination = output + (output_row * (n / 8) + output_col) * 16;
+    const int output_col = col_base / TW + tile_col;
+    if (output_row < m / 8 && output_col < n / TW) {
+        uint32_t* destination = output + (output_row * (n / TW) + output_col) * 16;
         #pragma unroll
         for (int word = 0; word < WORDS; ++word)
             destination[lane + GROUP * word] = words[word];
     }
 }
-template <int BM, int BN>
+template <int BM, int BN, int TW = 8>
 void launch_wide(const int* a, const int* bt, int m, int n, int k,
                  uint32_t* output, cudaStream_t stream) {
-    constexpr int THREADS = BM * BN / 32;
+    constexpr int THREADS = BM * BN * 2 / (8 * TW);
     const dim3 grid((n + BN - 1) / BN, (m + BM - 1) / BM);
-    transcripts_dp4a_wide<BM, BN><<<grid, THREADS, 0, stream>>>(
+    transcripts_dp4a_wide<BM, BN, TW><<<grid, THREADS, 0, stream>>>(
         a, bt, m, n, k / 4, output);
 }
 }
@@ -175,7 +175,7 @@ extern "C" int wr_transcripts_i8(const signed char* a, const signed char* bt,
     if (!a || !bt || !output || (reinterpret_cast<uintptr_t>(a) & 3)
         || (reinterpret_cast<uintptr_t>(bt) & 3) || (reinterpret_cast<uintptr_t>(output) & 3)
         || m <= 0 || n <= 0 || m > 4096 || n > 4096
-        || m % 8 || n % 8 || k < 128 || k > 65536 || k % 128)
+        || m % 8 || n % (variant == 8 ? 16 : 8) || k < 128 || k > 65536 || k % 128)
         return static_cast<int>(cudaErrorInvalidValue);
     const int* packed_a = reinterpret_cast<const int*>(a);
     const int* packed_bt = reinterpret_cast<const int*>(bt);
@@ -196,6 +196,7 @@ extern "C" int wr_transcripts_i8(const signed char* a, const signed char* bt,
         case 5: launch<128, 64>(packed_a, packed_bt, m, n, k, output, cuda_stream); break;
         case 6: launch<64, 128>(packed_a, packed_bt, m, n, k, output, cuda_stream); break;
         case 7: launch_wide<128, 64>(packed_a, packed_bt, m, n, k, output, cuda_stream); break;
+        case 8: launch_wide<64, 64, 16>(packed_a, packed_bt, m, n, k, output, cuda_stream); break;
         default: return static_cast<int>(cudaErrorInvalidValue);
     }
     return static_cast<int>(cudaGetLastError());

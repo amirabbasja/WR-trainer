@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from workrunner.config import ConfigError, DEFAULT_CONFIG, load_config, read_config, save_config, update_config
 from workrunner.config_export import _encrypt_object
+from workrunner.training_constants import WR_CAPTURED_SHAPE
 
 
 class ConfigSchemeTests(unittest.TestCase):
@@ -23,6 +24,25 @@ class ConfigSchemeTests(unittest.TestCase):
         self.values["S3"]["password"] = "PRIVATE-S3-PASSWORD"
         self.values["training"]["output_dir"] = "results"
         self.values["side_job"]["repo_url"] = "https://huggingface.co/datasets/fixture/thesis"
+
+    def test_wr_shape_defaults_and_partial_config_compatibility(self):
+        fields = ('m', 'n', 'k', 'tile_h', 'tile_w')
+        for dimensions, expected in (({}, WR_CAPTURED_SHAPE),
+                                     ({'m': 128}, (128, 256, 2048, 8, 8))):
+            with self.subTest(dimensions=dimensions):
+                self.values['training'] = dimensions
+                save_config(self.path, self.values)
+                training = load_config(self.path)['training']
+                self.assertEqual(tuple(training[field] for field in fields), expected)
+
+    def test_device_array_keeps_order_and_rejects_duplicates(self):
+        self.values["device"] = ["cuda:1", 0]
+        save_config(self.path, self.values)
+        self.assertEqual(load_config(self.path)["device"], [1, 0])
+        for devices in ([], [0, "cuda:0"], [True], ["cpu"]):
+            with self.subTest(devices=devices), self.assertRaisesRegex(ConfigError, "device"):
+                update_config(self.path, {"device": devices})
+        self.assertEqual(load_config(self.path)["device"], [1, 0])
 
     def test_legacy_node_address_is_dropped_when_loading_and_saving(self):
         self.values["node"]["address"] = "legacy-value"

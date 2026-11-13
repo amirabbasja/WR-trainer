@@ -69,7 +69,7 @@ __global__ void apply_noise_kernel(
     int8_t* out_a, int8_t* out_bt
 ) {
     const uint32_t stride = blockDim.x * gridDim.x;
-    for (uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    for (uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
          index < total; index += stride) {
         const bool is_b = index >= a_size;
         const uint32_t offset = is_b ? index - a_size : index;
@@ -119,7 +119,7 @@ extern "C" int wr_apply_noise(
     const uint64_t a_size = static_cast<uint64_t>(m) * static_cast<uint64_t>(k);
     const uint64_t total = (static_cast<uint64_t>(m) + static_cast<uint64_t>(n))
                          * static_cast<uint64_t>(k);
-    if (total > INT_MAX) return static_cast<int>(cudaErrorInvalidValue);
+    if (total > UINT32_MAX) return static_cast<int>(cudaErrorInvalidValue);
     constexpr uint32_t threads = 256;
     const uint64_t needed = (total + threads - 1) / threads;
     const uint32_t blocks = static_cast<uint32_t>(needed < 65535 ? needed : 65535);

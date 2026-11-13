@@ -2,6 +2,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar
 import numpy as np
 import torch
 from .stream_digest import StreamDigest
@@ -40,6 +41,7 @@ def load_official_helpers(source: str | Path) -> None:
 
 @dataclass(frozen=True)
 class TrainingConfig:
+    _MAX_N: ClassVar[int] = 4096
     m: int = 256
     n: int = 256
     k: int = 2048
@@ -47,8 +49,8 @@ class TrainingConfig:
     tile_w: int = 8
 
     def __post_init__(self) -> None:
-        if not (128 <= self.m <= 4096 and 128 <= self.n <= 4096):
-            raise ValueError('m and n must each be between 128 and 4096')
+        if not (128 <= self.m <= 4096 and 128 <= self.n <= self._MAX_N):
+            raise ValueError(f'm must be between 128 and 4096, and n between 128 and {self._MAX_N}')
         if not 2048 <= self.k <= 65536 or self.k % RANK:
             raise ValueError('k must be a multiple of 128 between 2048 and 65536')
         if self.tile_h <= 0 or self.tile_w <= 0 or self.tile_h % 2 or self.tile_w % 2:

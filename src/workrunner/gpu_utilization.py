@@ -49,6 +49,11 @@ def _query_gpu_utilization(identifier):
     except (OSError, subprocess.SubprocessError, ValueError, UnicodeError):
         return None
 
+def busiest_gpu_sample(monitors):
+    samples = (monitor.read_sample() for monitor in monitors)
+    return max((sample for sample in samples if sample[0] is not None and sample[1] is not None),
+               default=(None, None))
+
 class GpuUtilization:
 
     def __init__(self, device: str):

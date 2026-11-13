@@ -10,7 +10,10 @@ import shutil
 import tempfile
 import torch
 from torch import nn
+
+from .cuda_devices import resolve_cuda_devices
 from .training_artifacts import training_output
+
 LOG = logging.getLogger('workrunner.aux_training')
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -87,12 +90,14 @@ class SideJob:
     def __init__(self, config, *, project_root=None, before_log=None):
         self.config = copy.deepcopy(config['side_job'])
         self.generate_artifacts = config.get('training', {}).get('generate_artifacts', True)
-        self.device = torch.device(config['device'])
+        self.devices = resolve_cuda_devices(config['device'], unavailable='job-1 requires an available CUDA GPU')
+        self.device = self.devices[0]
         self.directory = Path(project_root or PROJECT_ROOT) / 'data' / 'side-job'
         if self.generate_artifacts:
             self.directory.mkdir(parents=True, exist_ok=True)
         self._stack = ExitStack()
         self.model = None
+        self.forward_model = None
         self.optimizer = None
         self.scaler = None
         self.source = None
@@ -143,10 +148,6 @@ class SideJob:
         return {'model': self.model.state_dict(), 'optimizer': self.optimizer.state_dict(), 'scaler': self.scaler.state_dict(), 'epoch': self.epoch, 'next_shard': self.next_shard, 'architecture': self._architecture()}
 
     def _initialize(self):
-        if self.device.type != 'cuda' or not torch.cuda.is_available():
-            raise ValueError('job-1 requires an available CUDA GPU')
-        if self.device.index is not None and self.device.index >= torch.cuda.device_count():
-            raise ValueError('job-1 device selects an unavailable CUDA GPU')
         from .aux_datasets import DatasetSource
         torch.manual_seed(self.config['seed'])
         self.model = OrientationCNN(**self._architecture()).to(self.device)
@@ -181,8 +182,12 @@ class SideJob:
         elif self.generate_artifacts:
             save_checkpoint(self.directory, self._checkpoint(), rotate=False)
             self._log('Created new job-1 weights')
+        self.forward_model = self.model
+        if len(self.devices) > 1:
+            self.forward_model = nn.DataParallel(self.model, device_ids=[device.index for device in self.devices])
         self._progress_epoch = self.epoch + 1
-        self._log('job-1 CNN: %s; %s parameters', torch.cuda.get_device_name(self.device), f'{sum((parameter.numel() for parameter in self.model.parameters())):,}')
+        names = ', '.join(torch.cuda.get_device_name(device) for device in self.devices)
+        self._log('job-1 CNN: %s; %s parameters', names, f'{sum((parameter.numel() for parameter in self.model.parameters())):,}')
         if self.config['epochs'] and self.epoch >= self.config['epochs']:
             self._progress_epoch = self.epoch
             self._progress_phase = 'Complete'
@@ -290,7 +295,7 @@ class SideJob:
         labels = labels.to(self.device, non_blocking=True)
         self.optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.config['use_amp']):
-            logits = self.model(images)
+            logits = self.forward_model(images)
             loss = nn.functional.cross_entropy(logits, labels)
         if not torch.isfinite(loss):
             raise RuntimeError('job-1 training produced a nonfinite loss')
@@ -309,14 +314,14 @@ class SideJob:
             self._clear_shard()
         finally:
             self._stack.close()
-            self.optimizer = self.scaler = self.model = self.source = None
+            self.optimizer = self.scaler = self.model = self.forward_model = self.source = None
             self.closed = True
 
 def main(argv=None):
     from .login_config import load_training_config
     from .paths import default_config_path
     from .progress import LiveProgress, job_status
-    from .gpu_utilization import GpuUtilization
+    from .gpu_utilization import GpuUtilization, busiest_gpu_sample
     from .telegram import TelegramUpdates
     parser = argparse.ArgumentParser(description='Train the job-1 page-orientation CNN on CUDA')
     parser.add_argument('--config', type=Path, default=default_config_path())
@@ -333,16 +338,13 @@ def main(argv=None):
             config['side_job']['epochs'] = args.epochs
         with training_output(generate_artifacts), ExitStack() as resources:
             torch.set_num_threads(min(4, os.cpu_count() or 1))
-            telemetry_device = torch.device(config['device'])
-            if telemetry_device.type == 'cuda' and telemetry_device.index is None:
-                telemetry_device = torch.device('cuda', torch.cuda.current_device())
-            gpu = resources.enter_context(GpuUtilization(str(telemetry_device)))
             progress = resources.enter_context(LiveProgress(enabled=generate_artifacts))
             job = SideJob(config, before_log=progress.clear)
             resources.callback(job.close)
+            monitors = [resources.enter_context(GpuUtilization(str(device))) for device in job.devices]
 
             def snapshot():
-                return job_status(1, "job-1", gpu.read(), None, job._progress_epoch)
+                return job_status(1, "job-1", busiest_gpu_sample(monitors)[0], None, job._progress_epoch)
 
             updates = resources.enter_context(TelegramUpdates(config, snapshot))
             updates.event("Job 1 job-1 starting")

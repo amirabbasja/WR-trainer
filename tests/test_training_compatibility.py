@@ -3,6 +3,7 @@ from training_samples import sample_text
 import unittest
 
 from workrunner.S3_protocol import S3Dialect, S3Job
+from workrunner.training_client import TrainingSession
 from workrunner.training_methods import wire_request
 from workrunner.training_constants import s6_noise_seed_prefix, s7_legacy_alias
 from workrunner.training_protocol import TrainingDialect, TrainingSubmission
@@ -58,6 +59,14 @@ class TrainingCompatibilityTests(unittest.TestCase):
         self.assertEqual(fields[text_fixture('776f726b65725f6e6f6e6365')], second.hex())
         report = TrainingDialect.report_request('device', 25, 3)
         self.assertEqual(report['params'], [{text_fixture('6861736872617465'): 25, 'name': 'device'}])
+
+    def test_shape_rejection_is_a_submission_reply(self):
+        reply = {'id': 11, 'status': 0, 'result': 'shape not allowed'}
+        session = TrainingSession({'host': '127.0.0.1', 'port': 9000, 'WR_S2': 'fixture'})
+        self.assertEqual(session.dialect.classify(reply), 'reply')
+        result = session._submission_result(reply)
+        self.assertFalse(result.confirmed)
+        self.assertEqual(result.error, 'shape not allowed')
 
     def test_cert_domain_and_legacy_protocol(self):
         self.assertEqual(s6_noise_seed_prefix(), bytes.fromhex('706561726c2f636572742d76332f6e6f6973652d736565642f'))

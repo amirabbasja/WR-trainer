@@ -1,10 +1,14 @@
 from collections.abc import Callable
 from contextlib import contextmanager
+import threading
 import numpy as np
 import torch
 RANK = 128
 _ROTATE_RIGHT_MASK = (1 << 13) - 1
 _TRANSCRIPT_SCRATCH_BYTES = 256 * 1024 * 1024
+_matmul_lock = threading.Lock()
+_matmul_users = 0
+_previous_matmul_settings = None
 
 class TrainingCancelled(RuntimeError):
     pass
@@ -35,15 +39,22 @@ def _xor_tiles(values: torch.Tensor) -> torch.Tensor:
 
 @contextmanager
 def _exact_matmul():
-    previous_precision = torch.get_float32_matmul_precision()
-    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    global _matmul_users, _previous_matmul_settings
+    with _matmul_lock:
+        if _matmul_users == 0:
+            _previous_matmul_settings = (torch.get_float32_matmul_precision(), torch.backends.cuda.matmul.allow_tf32)
+            torch.set_float32_matmul_precision('highest')
+            torch.backends.cuda.matmul.allow_tf32 = False
+        _matmul_users += 1
     try:
-        torch.set_float32_matmul_precision('highest')
-        torch.backends.cuda.matmul.allow_tf32 = False
         yield
     finally:
-        torch.set_float32_matmul_precision(previous_precision)
-        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+        with _matmul_lock:
+            _matmul_users -= 1
+            if _matmul_users == 0:
+                precision, allow_tf32 = _previous_matmul_settings
+                torch.set_float32_matmul_precision(precision)
+                torch.backends.cuda.matmul.allow_tf32 = allow_tf32
 
 def _destination(device):
     destination = torch.device(device)

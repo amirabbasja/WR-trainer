@@ -308,6 +308,9 @@ class S3Session:
             raise pending.error
         if pending.response is None:
             raise S3ConnectionError(constant_text(_ACK_MISSING))
-        if self.dialect.accept(pending.response):
+        return self._submission_result(pending.response)
+
+    def _submission_result(self, response: dict) -> SubmissionResult:
+        if self.dialect.accept(response):
             return SubmissionResult(True)
         return SubmissionResult(False, constant_text(_FAILED_RESULT))

@@ -5,10 +5,10 @@ import logging
 import threading
 import time
 from typing import Callable
-from .S3_client import JobSnapshot, S3AuthenticationError, S3CompatibilityError, S3Session, _seconds
+from .S3_client import JobSnapshot, S3AuthenticationError, S3CompatibilityError, S3Session, SubmissionResult, _seconds
 from .S3_protocol import S3ProtocolError
 from .S3_transport import S3ConnectionError
-from .training_protocol import UnknownTrainingRequest, TrainingDialect
+from .training_protocol import SHAPE_REJECTED, UnknownTrainingRequest, TrainingDialect
 from . import training_constants as wire
 LOG = logging.getLogger(wire.LOGGER_NAME)
 
@@ -84,9 +84,12 @@ class TrainingSession(S3Session):
             self._expire_reports_locked()
             return self._latest_report_ok
 
-    @neutral_protocol_text()
     def send_device_report(self, gpu_name: str, work_rate: float) -> int:
-        self.dialect.report_request(gpu_name, work_rate, 0)
+        return self.send_devices_report(((gpu_name, work_rate),))
+
+    @neutral_protocol_text()
+    def send_devices_report(self, devices) -> int:
+        request = self.dialect.devices_report_request(devices, 0)
         with self._send_lock:
             with self._condition:
                 self._raise_failure()
@@ -97,7 +100,7 @@ class TrainingSession(S3Session):
                     del self._report_pending[next(iter(self._report_pending))]
                     LOG.warning(constant_text(FixedAlias('training.log.accelerator_metrics_acknowledgement_missing')))
                 request_id = self._next_id
-                request = self.dialect.report_request(gpu_name, work_rate, request_id)
+                request['id'] = request_id
                 self._next_id += 1
                 self._report_pending[request_id] = time.monotonic() + self.transport.read_timeout
                 self._latest_report_id = request_id
@@ -277,6 +280,11 @@ class TrainingSession(S3Session):
                 if remaining <= 0:
                     return None
                 self._condition.wait(min(remaining, 0.1))
+
+    def _submission_result(self, response: dict) -> SubmissionResult:
+        if response['status'] == 0 and response['result'] == SHAPE_REJECTED:
+            return SubmissionResult(False, SHAPE_REJECTED)
+        return super()._submission_result(response)
 
     def raise_if_failed(self) -> None:
         deadline = time.monotonic() + 1

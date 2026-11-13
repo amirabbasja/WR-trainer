@@ -49,7 +49,8 @@ class GpuPacer:
     _max_sample_age = 2.0
 
     def __init__(self, device, max_utilization):
-        self.device = device
+        self.devices = device if isinstance(device, tuple) else (device,)
+        self.device = self.devices[0]
         self._started = None
         self._deadline = None
         self._reader = None
@@ -79,7 +80,8 @@ class GpuPacer:
 
     @contextmanager
     def operations(self, stopped=None, *, deadline=None):
-        if self.max_utilization == 100:
+        # DataParallel executes replica operations on other threads.
+        if self.max_utilization == 100 or len(self.devices) > 1:
             yield
             return
         self._operation_paced = True
@@ -116,13 +118,17 @@ class GpuPacer:
     def finish(self, *, cancelled=False):
         if self._started is None:
             if cancelled:
-                torch.cuda.synchronize(self.device)
+                self._synchronize()
             return
-        torch.cuda.synchronize(self.device)
+        self._synchronize()
         now = time.monotonic()
         work_seconds = self._operation_seconds if self._operation_paced else now - self._started
         self._deadline = now + work_seconds * (100 - self.max_utilization) / self.max_utilization
         self._started = None
+
+    def _synchronize(self):
+        for device in self.devices:
+            torch.cuda.synchronize(device)
 
     def wait(self, stopped, *, deadline=None):
         if self._deadline is not None:
