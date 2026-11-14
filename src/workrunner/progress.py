@@ -38,6 +38,8 @@ def job_status(job_number, job_title, gpu_percent, time_remaining, speed, *, cnn
         remaining = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     if speed is None or not math.isfinite(speed):
         value = "0"
+    elif title != "job-1" and abs(speed) >= 1_000_000:
+        value = f"{speed:.2e}"
     elif isinstance(speed, int):
         value = str(speed)
     else:
