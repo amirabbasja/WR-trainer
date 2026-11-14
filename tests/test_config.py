@@ -69,6 +69,26 @@ class ConfigSchemeTests(unittest.TestCase):
         self.assertEqual(set(self.directory.iterdir()), {self.path})
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
 
+    def test_mixed_job_requires_a_dataset_only_when_active(self):
+        save_config(self.path, self.values)
+        stored = json.loads(self.path.read_text())
+        stored["side_job"]["repo_url"] = ""
+        stored["training"]["job_sequence"] = [
+            {"title": "job-2", "time": 30, "max_gpu_utilization": 1},
+        ]
+        self.path.write_text(json.dumps(stored))
+        with self.assertRaisesRegex(ConfigError, "side_job.repo_url"):
+            load_config(self.path)
+        stored["side_job"]["repo_url"] = self.values["side_job"]["repo_url"]
+        self.path.write_text(json.dumps(stored))
+        self.assertEqual(load_config(self.path)["training"]["job_sequence"],
+                         stored["training"]["job_sequence"])
+        stored["side_job"]["repo_url"] = ""
+        stored["training"]["job_sequence"][0]["max_gpu_utilization"] = 0
+        self.path.write_text(json.dumps(stored))
+        self.assertEqual(load_config(self.path)["training"]["job_sequence"],
+                         stored["training"]["job_sequence"])
+
     def test_plain_settings_can_be_edited_without_reencrypting_s3(self):
         save_config(self.path, self.values)
         stored = json.loads(self.path.read_text())

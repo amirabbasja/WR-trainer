@@ -2,6 +2,8 @@ import threading
 import time
 from urllib.request import Request
 
+from .duty_cycle import MINING_JOBS
+
 from .socks_proxy import current_proxy, http_opener
 from .vpn import current_vpn, VPNError
 
@@ -72,7 +74,7 @@ class VPNJobGuard:
             return False
         number, kind, percentage, until = self.schedule.position()
         now = time.monotonic()
-        if kind != "job-0" or percentage <= 0 or (boundary is not None and (boundary != until or boundary != self._active_until)):
+        if kind not in MINING_JOBS or percentage <= 0 or (boundary is not None and (boundary != until or boundary != self._active_until)):
             return False
         with self._lock:
             if self._until == until:
@@ -84,7 +86,7 @@ class VPNJobGuard:
                 session.close()
             except Exception:
                 pass
-        self.updates.event(f"Job {number} job-0: VPN connection lost; waiting until the job finishes", direct=True)
+        self.updates.event(f"Job {number} {kind}: VPN connection lost; waiting until the job finishes", direct=True)
         return now < until
 
     def blocked(self):
@@ -137,7 +139,7 @@ class VPNJobGuard:
             _, kind, percentage, boundary = self.schedule.position()
             core_ready = (self.manager is None or (self.manager.process is not None
                           and self.manager.process.poll() is None))
-            if (kind == "job-0" and percentage > 0 and core_ready
+            if (kind in MINING_JOBS and percentage > 0 and core_ready
                     and boundary == self._active_until and not self.blocked()):
                 try:
                     with opener.open(Request(self.settings["check_url"]), timeout=5.0) as response:

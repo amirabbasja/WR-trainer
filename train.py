@@ -146,6 +146,7 @@ def run(root=None, *, login_only=False):
         set_checkout_directories(root)
         from workrunner.config import resolve_S3_settings
         from workrunner.login_config import load_training_config
+        from workrunner.progress import in_notebook
         from workrunner.training_artifacts import training_output
         config_path = root / 'config.json'
         config = load_training_config(config_path)
@@ -172,7 +173,7 @@ def run(root=None, *, login_only=False):
             print('Stopped', flush=True)
         return 130
     except (ValueError, RuntimeError, ImportError, OSError) as error:
-        if generate_artifacts:
+        if generate_artifacts or in_notebook():
             print(f'Training failed ({type(error).__name__}): {error}', flush=True)
         return 1
     finally:

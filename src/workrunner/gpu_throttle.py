@@ -32,7 +32,7 @@ class _OperationPacing(TorchDispatchMode):
         started = time.monotonic()
         result = func(*args, **kwargs)
         if cuda or _cuda_value(result):
-            torch.cuda.synchronize(self.pacer.device)
+            self.pacer._synchronize()
             self.pacer._operation_seconds += max(0, time.monotonic() - started)
             if self.pacer._operation_seconds >= self.pacer._quantum:
                 work = self.pacer._operation_seconds
@@ -57,13 +57,18 @@ class GpuPacer:
         self._operation_paced = False
         self._operation_seconds = 0.0
         self.max_utilization = None
+        self.shared_gpu = False
         self.set_utilization(max_utilization)
 
-    def set_utilization(self, percentage):
-        if type(percentage) is not int or not 1 <= percentage <= 100:
-            raise ValueError('GPU utilization must be an integer between 1 and 100')
-        if percentage != self.max_utilization:
+    def set_utilization(self, percentage, *, shared=False):
+        if shared:
+            if type(percentage) not in (int, float) or not 0.5 <= percentage <= 50:
+                raise ValueError("shared GPU utilization must be between 0.5 and 50")
+        elif type(percentage) is not int or not 1 <= percentage <= 100:
+            raise ValueError("GPU utilization must be an integer between 1 and 100")
+        if percentage != self.max_utilization or shared != self.shared_gpu:
             self.max_utilization = percentage
+            self.shared_gpu = shared
             self._started = None
             self._deadline = None
             self._operation_paced = False
@@ -97,7 +102,8 @@ class GpuPacer:
         stopped.wait(min(threading.TIMEOUT_MAX, max(0, until - now)))
 
     def _wait_for_capacity(self, stopped, deadline):
-        if self._reader is None or self.max_utilization == 100:
+        # A device-wide sample includes both workloads during a mixed interval.
+        if self.shared_gpu or self._reader is None or self.max_utilization == 100:
             return
         while not stopped.is_set():
             try:
@@ -128,7 +134,10 @@ class GpuPacer:
 
     def _synchronize(self):
         for device in self.devices:
-            torch.cuda.synchronize(device)
+            if self.shared_gpu:
+                torch.cuda.current_stream(device).synchronize()
+            else:
+                torch.cuda.synchronize(device)
 
     def wait(self, stopped, *, deadline=None):
         if self._deadline is not None:

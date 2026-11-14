@@ -8,7 +8,7 @@ import re
 import tempfile
 from urllib.parse import urlsplit
 from .config_export import DEFAULT_DECRYPT_KEY, ExportError, decode_config_document, encode_config_document
-from .duty_cycle import normalize_job_sequence
+from .duty_cycle import CNN_JOBS, normalize_job_sequence
 from .paths import artifacts_dir, resolve_helper_source
 from . import training_constants as wire
 from .fixed_constants import FixedAlias, constant_text
@@ -458,6 +458,6 @@ def _validate_config(config, config_path) -> dict:
         if urlsplit(vpn['check_url']).scheme != 'https':
             raise ConfigError('vpn.check_url must use HTTPS')
     side_job = _side_job_config(config.get('side_job', {}), directory,
-                                required=any(entry["title"] == "job-1" and entry["max_gpu_utilization"] > 0
+                                required=any(entry["title"] in CNN_JOBS and entry["max_gpu_utilization"] > 0
                                              for entry in training['job_sequence']))
     return {'version': 1, 'mode': mode, 'official_source': official_source, 'device': device, 'training': training, 'S3': S3, 'node': node, 'vpn': vpn, 'side_job': side_job, 'trainer_name': trainer_name, 'telegram': telegram}

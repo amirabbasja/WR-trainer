@@ -320,7 +320,7 @@ class SideJob:
 def main(argv=None):
     from .login_config import load_training_config
     from .paths import default_config_path
-    from .progress import LiveProgress, job_status
+    from .progress import LiveProgress, in_notebook, job_status
     from .gpu_utilization import GpuUtilization, busiest_gpu_sample
     from .telegram import TelegramUpdates
     parser = argparse.ArgumentParser(description='Train the job-1 page-orientation CNN on CUDA')
@@ -338,7 +338,9 @@ def main(argv=None):
             config['side_job']['epochs'] = args.epochs
         with training_output(generate_artifacts), ExitStack() as resources:
             torch.set_num_threads(min(4, os.cpu_count() or 1))
-            progress = resources.enter_context(LiveProgress(enabled=generate_artifacts))
+            progress = resources.enter_context(LiveProgress(
+                enabled=generate_artifacts or in_notebook(), trainer_name=config.get("trainer_name", "trainer"),
+            ))
             job = SideJob(config, before_log=progress.clear)
             resources.callback(job.close)
             monitors = [resources.enter_context(GpuUtilization(str(device))) for device in job.devices]
@@ -350,6 +352,7 @@ def main(argv=None):
             updates.event("Job 1 job-1 starting")
             resources.callback(updates.event, "Job 1 job-1 finished")
             progress.update(snapshot(), force=True)
+            progress.start_refresh(snapshot)
             while job.step():
                 progress.update(snapshot())
             progress.update(snapshot(), force=True)

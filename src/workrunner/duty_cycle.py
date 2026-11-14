@@ -1,8 +1,15 @@
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from contextvars import copy_context
 import logging
 import math
+import sys
 import threading
 import time
+
+MINING_JOBS = ("job-0", "job-2")
+CNN_JOBS = ("job-1", "job-2")
+JOB_TITLES = ("job-0", "job-1", "job-2")
+
 
 def normalize_job_sequence(value, *, field="job_sequence"):
     """Copy job dictionaries after validating titles, seconds, and utilization."""
@@ -18,8 +25,8 @@ def normalize_job_sequence(value, *, field="job_sequence"):
         title = entry["title"]
         seconds = entry["time"]
         percentage = entry["max_gpu_utilization"]
-        if type(title) is not str or title not in ("job-0", "job-1"):
-            raise ValueError(f'{field} title must be "job-0" or "job-1"')
+        if type(title) is not str or title not in JOB_TITLES:
+            raise ValueError(f'{field} title must be "job-0", "job-1", or "job-2"')
         if type(percentage) is not int or not -1 <= percentage <= 100:
             raise ValueError(f"{field} max_gpu_utilization must be an integer between -1 and 100")
         try:
@@ -36,7 +43,7 @@ def normalize_job_sequence(value, *, field="job_sequence"):
 
 
 class JobSequence:
-    """Repeat job-0 and job-1 intervals on one monotonic timeline."""
+    """Repeat job intervals on one monotonic timeline."""
 
     def __init__(self, entries, *, started=None):
         self.entries = normalize_job_sequence(entries)
@@ -44,12 +51,15 @@ class JobSequence:
         self._total = sum(entry["time"] for entry in self.entries)
         self._exit_offset = None
         self._exit_kind = None
+        self.has_mixed_job = False
         elapsed = 0
         for entry in self.entries:
             if entry["max_gpu_utilization"] == -1:
                 self._exit_offset = elapsed
                 self._exit_kind = entry["title"]
                 break
+            if entry["title"] == "job-2" and entry["max_gpu_utilization"] > 0:
+                self.has_mixed_job = True
             elapsed += entry["time"]
 
     @property
@@ -153,33 +163,103 @@ class ScheduledSideJob:
         self.job = None
         self.exhausted = False
         self._previous_interval = None
+        self._thread = None
+        self._stopped = None
+        self._failure = None
+
+    def start_concurrent(self, schedule, stopped, devices, pacer, *, deadline=None):
+        """Use one CNN worker for both CNN roles in a mixed schedule."""
+        self._stopped = stopped
+        context = copy_context()
+        self._thread = threading.Thread(
+            target=context.run, args=(self._run_concurrent, schedule, stopped, devices, pacer, deadline),
+            name="cnn-schedule",
+        )
+        try:
+            self._thread.start()
+        except BaseException:
+            self._thread = self._stopped = None
+            raise
+
+    def _run_concurrent(self, schedule, stopped, devices, pacer, deadline):
+        try:
+            import torch
+
+            # Keep the model and optimizer on the same streams across job-1 and job-2.
+            # The mining workers continue using their own current streams.
+            streams = [torch.cuda.Stream(device=device) for device in devices]
+            with ExitStack() as stack:
+                for stream in streams:
+                    stack.enter_context(torch.cuda.stream(stream))
+                while not stopped.is_set():
+                    kind, percentage, boundary = schedule.current_job()
+                    until = boundary if deadline is None else min(boundary, deadline)
+                    if percentage == -1 or (deadline is not None and time.monotonic() >= deadline):
+                        return
+                    if kind in CNN_JOBS and percentage > 0:
+                        self._run_batch(stopped, pacer, kind, percentage, until)
+                    else:
+                        self._wait_until(stopped, until)
+        except BaseException as error:
+            self._failure = error
+            stopped.set()
+        finally:
+            if self.job is not None:
+                # Close the CNN's VPN in the same context that opened it.
+                try:
+                    self.job.close()
+                except BaseException as error:
+                    if self._failure is None:
+                        self._failure = error
+                    stopped.set()
+
+    @staticmethod
+    def _wait_until(stopped, until):
+        stopped.wait(min(threading.TIMEOUT_MAX, max(0, until - time.monotonic())))
 
     def run_if_active(self, schedule, stopped, pacer, *, deadline=None):
+        """Handle a CNN-only interval on the mining loop."""
         kind, percentage, boundary = schedule.current_job()
-        if kind != 'job-1' or percentage <= 0 or stopped.is_set():
+        if kind != "job-1" or percentage <= 0 or stopped.is_set():
             return False
         until = boundary if deadline is None else min(boundary, deadline)
         if time.monotonic() >= until:
             return False
-        if pacer.max_utilization != percentage:
+        if self._thread is not None:
+            self._wait_until(stopped, until)
+        else:
+            self._run_batch(stopped, pacer, kind, percentage, until)
+        return True
+
+    def _run_batch(self, stopped, pacer, kind, percentage, until):
+        def cancelled():
+            return stopped.is_set() or time.monotonic() >= until
+
+        if cancelled():
+            return
+        if kind == "job-2":
+            percentage /= 2
+            pacer.set_utilization(percentage, shared=True)
+        elif pacer.max_utilization != percentage or self._thread is not None:
             pacer.set_utilization(percentage)
-        if self._previous_interval != (percentage, boundary):
+        if self._previous_interval != (kind, percentage, until):
             if self.before_log is not None:
                 self.before_log()
-            logging.getLogger('workrunner').debug('job-1 effort GPU duty-cycle target: %d%%', percentage)
-            self._previous_interval = (percentage, boundary)
+            logging.getLogger("workrunner").debug(
+                "%s effort GPU duty-cycle target: %g%%", kind, percentage,
+            )
+            self._previous_interval = kind, percentage, until
         if self.exhausted:
             if self.on_progress is not None:
                 self.on_progress(self.job)
-            stopped.wait(min(threading.TIMEOUT_MAX, max(0, until - time.monotonic())))
-            return True
+            self._wait_until(stopped, until)
+            return
         if self.job is None:
             from .aux_training import SideJob
-            options = {'before_log': self.before_log} if self.before_log is not None else {}
+
+            options = {"before_log": self.before_log} if self.before_log is not None else {}
             self.job = SideJob(self.configuration, **options)
 
-        def cancelled():
-            return stopped.is_set() or time.monotonic() >= until or schedule.current_job()[0] != 'job-1' or (schedule.current()[0] <= 0)
         if self.on_progress is not None:
             self.on_progress(self.job)
         pacer.begin()
@@ -194,12 +274,18 @@ class ScheduledSideJob:
             self.on_progress(self.job)
         if not cancelled():
             if self.exhausted:
-                stopped.wait(min(threading.TIMEOUT_MAX, max(0, until - time.monotonic())))
+                self._wait_until(stopped, until)
             else:
                 pacer.wait(stopped, deadline=until)
-        return True
 
     def close(self):
-        if self.job is not None:
+        if self._thread is not None:
+            self._stopped.set()
+            self._thread.join()
+            self._thread = self._stopped = self.job = None
+            error, self._failure = self._failure, None
+            if error is not None and sys.exc_info()[0] is None:
+                raise error
+        elif self.job is not None:
             self.job.close()
             self.job = None
