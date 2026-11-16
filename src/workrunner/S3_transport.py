@@ -64,6 +64,7 @@ class S3Transport:
         self.ca_file = ca_file
         self.connect_timeout = _timeout(connect_timeout, 'connect')
         self.read_timeout = _timeout(read_timeout, 'read')
+        self.socket_timeout = self.read_timeout
         self._socket: socket.socket | None = None
         self._proxy = socks_proxy.current_proxy()
         self._message_channels = {}
@@ -96,7 +97,7 @@ class S3Transport:
             connection = socks_proxy.create_connection((self.host, self.port), timeout=self.connect_timeout, proxy=self._proxy)
             if context is not None:
                 connection = context.wrap_socket(connection, server_hostname=self.host)
-            connection.settimeout(self.read_timeout)
+            connection.settimeout(self.socket_timeout)
             self._socket = connection
             return self
         except TimeoutError:

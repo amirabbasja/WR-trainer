@@ -181,6 +181,16 @@ class NativeDeviceCleanupTests(unittest.TestCase):
         self.assertTrue(torch.equal(signal.cpu(), signal_cpu))
         self.assertEqual(key, bytes(range(32)))
 
+    def test_constant_tree_matches_the_padded_byte_stream_and_overwrites_key(self):
+        key = bytes(range(32))
+        value = 0xE7
+        for size in (1, 1023, 1025, 4099):
+            with self.subTest(size=size), self.capture_words() as saved:
+                padded = bytes([value]) * size + bytes(-size % 1024)
+                actual = native_cuda.constant_tree_root(size, value, key, self.device)
+                self.assertEqual(actual, Digest(padded, key=key).digest())
+                self.assert_wiped(saved, 1)
+
     def test_noise_keys_are_overwritten_without_corrupting_outputs_on_nondefault_stream(self):
         key_a, key_b = bytes(range(32)), bytes(reversed(range(32)))
         a_cpu = torch.full((128, 128), 7, dtype=torch.int8)
@@ -192,11 +202,32 @@ class NativeDeviceCleanupTests(unittest.TestCase):
         with self.capture_words() as saved, torch.cuda.stream(stream):
             a, bt = a_cpu.to(self.device), bt_cpu.to(self.device)
             actual_a, actual_bt = native_cuda.add_noise(a, bt, key_a, key_b)
-        self.assert_wiped(saved, 2)
+            constant_a = native_cuda.constant_noised_operand(128, 128, 7, key_a, self.device)
+            constant_bt = native_cuda.constant_noised_operand(128, 128, -5, key_b, self.device, right=True)
+        self.assert_wiped(saved, 4)
         self.assertTrue(torch.equal(actual_a.cpu(), expected_a))
         self.assertTrue(torch.equal(actual_bt.cpu(), expected_bt))
+        self.assertTrue(torch.equal(constant_a.cpu(), expected_a))
+        self.assertTrue(torch.equal(constant_bt.cpu(), expected_bt))
         self.assertTrue(torch.equal(a.cpu(), a_cpu))
         self.assertTrue(torch.equal(bt.cpu(), bt_cpu))
+
+    def test_wide_transcripts_match_reference_with_partial_blocks(self):
+        from workrunner.gpu_noisy_gemm import gpu_transcripts
+
+        rng = np.random.default_rng(71)
+        a = rng.integers(-128, 128, size=(72, 4096), dtype=np.int8)
+        bt = rng.integers(-128, 128, size=(144, 4096), dtype=np.int8)
+        expected = gpu_transcripts(a, bt.T, tile_w=16, device='cpu')
+        a_gpu = torch.from_numpy(a).to(self.device)
+        bt_gpu = torch.from_numpy(bt).to(self.device)
+        # The vector path requires 16-byte alignment. A 4-byte offset uses the scalar path.
+        storage = torch.empty(bt.size + 4, dtype=torch.int8, device=self.device)
+        unaligned_bt = storage[4:].view(bt.shape)
+        unaligned_bt.copy_(bt_gpu)
+        for operand in (bt_gpu, unaligned_bt):
+            actual = native_cuda.transcripts_device(a_gpu, operand, tile_w=16)
+            np.testing.assert_array_equal(actual.cpu().numpy().view(np.uint32), expected)
 
     def test_candidate_keys_and_target_are_overwritten_after_capacity_retries(self):
         key = bytes(range(32))
@@ -231,7 +262,9 @@ class NativeDeviceCleanupTests(unittest.TestCase):
         transcripts = torch.ones((1, 1, 16), dtype=torch.int32, device=self.device)
         operations = (
             (lambda: getattr(native_cuda, ROOT_FUNCTION)(signal, key), 1),
+            (lambda: native_cuda.constant_tree_root(1024, 64, key, self.device), 1),
             (lambda: native_cuda.add_noise(signal, signal, key, key), 2),
+            (lambda: native_cuda.constant_noised_operand(128, 128, 64, key, self.device), 1),
             (lambda: getattr(native_cuda, MATCH_FUNCTION)(transcripts, key, (1 << 256) - 1), 2),
         )
         for operation, count in operations:

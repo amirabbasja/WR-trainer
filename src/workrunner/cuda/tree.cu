@@ -1,7 +1,8 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include "digest_core.cuh"
-__global__ void wr_tree_leaf_kernel(const unsigned char* data, size_t bytes,
+template <bool Constant>
+__global__ void wr_tree_leaf_kernel(const unsigned char* data, size_t bytes, uint32_t fill,
                                         const uint32_t* key, uint32_t* output,
                                         int leaves) {
     int leaf = blockIdx.x * blockDim.x + threadIdx.x;
@@ -15,7 +16,13 @@ __global__ void wr_tree_leaf_kernel(const unsigned char* data, size_t bytes,
         for (int word = 0; word < 16; ++word) {
             size_t offset = size_t(leaf) * 1024 + block * 64 + word * 4;
             uint32_t value = 0;
-            if (offset + 4 <= bytes && (reinterpret_cast<uintptr_t>(data + offset) & 3) == 0) {
+            if constexpr (Constant) {
+                if (offset + 4 <= bytes) {
+                    value = fill;
+                } else if (offset < bytes) {
+                    value = fill & (0xffffffffu >> (8 * (4 - (bytes - offset))));
+                }
+            } else if (offset + 4 <= bytes && (reinterpret_cast<uintptr_t>(data + offset) & 3) == 0) {
                 value = *reinterpret_cast<const uint32_t*>(data + offset);
             } else {
                 #pragma unroll
@@ -57,8 +64,17 @@ extern "C" int wr_tree_leaves(const unsigned char* data, size_t bytes,
                                    void* stream) {
     if (!data || !key || !output || !bytes) return int(cudaErrorInvalidValue);
     int leaves = int((bytes + 1023) / 1024);
-    wr_tree_leaf_kernel<<<(leaves + 127) / 128, 128, 0,
-        reinterpret_cast<cudaStream_t>(stream)>>>(data, bytes, key, output, leaves);
+    wr_tree_leaf_kernel<false><<<(leaves + 127) / 128, 128, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(data, bytes, 0, key, output, leaves);
+    return int(cudaGetLastError());
+}
+extern "C" int wr_tree_constant_leaves(size_t bytes, uint8_t value, const uint32_t* key,
+                                        uint32_t* output, void* stream) {
+    if (!key || !output || !bytes) return int(cudaErrorInvalidValue);
+    int leaves = int((bytes + 1023) / 1024);
+    const uint32_t fill = static_cast<uint32_t>(value) * 0x01010101u;
+    wr_tree_leaf_kernel<true><<<(leaves + 127) / 128, 128, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(nullptr, bytes, fill, key, output, leaves);
     return int(cudaGetLastError());
 }
 extern "C" int wr_tree_parents(const uint32_t* input, int count,

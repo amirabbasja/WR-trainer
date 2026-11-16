@@ -5,7 +5,7 @@ import math
 import re
 from typing import Any
 from .S6_requests import build_submission_request
-from .S3_protocol import S3Job, S3ProtocolError, _text, _Agent, _DEFAULT_AGENT
+from .S3_protocol import S3Job, S3ProtocolError, _text
 from . import training_constants as wire
 from .fixed_constants import FixedAlias, constant_buffer, constant_bytes, constant_text
 
@@ -96,16 +96,15 @@ class TrainingSubmission:
             raise S3ProtocolError(constant_text(_BAD_RESULT)) from error
 
 class TrainingDialect:
-    agent = _Agent()
-
-    def __init__(self, training_identity: str | None, worker: str, agent: str=_DEFAULT_AGENT) -> None:
+    def __init__(self, training_identity: str | None, worker: str, agent: str=wire.WR_CLIENT_AGENT) -> None:
         self.training_identity = None if training_identity is None else _text(training_identity, 'WR_S2', 256)
         self.worker = _text(worker, wire.DEVICE_ID, 128, allow_empty=True)
-        self._agent = _DEFAULT_AGENT if agent is _DEFAULT_AGENT else _text(agent, 'agent', 128)
+        # Existing WR configs can contain the previously saved default agent.
+        self.agent = wire.WR_CLIENT_AGENT if agent == wire.CLIENT_AGENT else _text(agent, 'agent', 128)
         if any(character.isspace() for character in (training_identity or '') + worker):
             raise S3ProtocolError(constant_text(_BAD_ACCOUNT))
 
-    def auth_requests(self, start_id: int=1) -> list[dict[str, Any]]:
+    def auth_requests(self, start_id: int=0) -> list[dict[str, Any]]:
         if self.training_identity is None:
             raise S3ProtocolError('WR login requires a configured identity')
         if type(start_id) is not int or not 0 <= start_id < 1 << 64:

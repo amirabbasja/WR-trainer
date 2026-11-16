@@ -1,4 +1,5 @@
 from __future__ import annotations
+from dataclasses import dataclass
 from .noise_bounds import tensor_domain, noise_draw
 from functools import lru_cache
 import struct
@@ -39,6 +40,12 @@ def _tile_indices(tile, offsets):
     return tuple(start + offset for offset in offsets)
 
 
+@lru_cache(maxsize=2)
+def _gather_indices(size, offsets):
+    return torch.tensor([index for tile in range(size // len(offsets))
+                         for index in _tile_indices(tile, offsets)], dtype=torch.long, device='cpu')
+
+
 class CapturedTrainingConfig(TrainingConfig):
     _MAX_N = WR_CAPTURED_SHAPE[1]
 
@@ -61,19 +68,17 @@ def compute_captured_batch(batch, training_threshold, device, cancelled):
     from .gpu_noisy_gemm import TrainingCancelled
 
     cfg = batch.config
-    # Gather the periodic tiles into the contiguous layout expected by DP4A.
-    rows = [index for tile in range(cfg.m // cfg.tile_h)
-            for index in _tile_indices(tile, _ROW_OFFSETS)]
-    a = batch.a_noised.index_select(0, torch.tensor(rows, device=device))
+    # Transfer each periodic gather map once, then keep matrix scratch bounded by a chunk.
+    rows = _gather_indices(cfg.m, _ROW_OFFSETS).to(device)
+    cols = _gather_indices(cfg.n, _COLUMN_OFFSETS).to(device)
+    a = batch.a_noised.index_select(0, rows)
     matches = []
     for start in range(0, cfg.n, _COLUMN_CHUNK_SIZE):
         if cancelled():
             raise TrainingCancelled('training job cancelled')
         first_tile = start // cfg.tile_w
         stop = min(start + _COLUMN_CHUNK_SIZE, cfg.n)
-        cols = [index for tile in range(first_tile, stop // cfg.tile_w)
-                for index in _tile_indices(tile, _COLUMN_OFFSETS)]
-        bt = batch.b_noised_t.index_select(0, torch.tensor(cols, device=device))
+        bt = batch.b_noised_t.index_select(0, cols[start:stop])
         transcripts = native_cuda.transcripts_device(a, bt, tile_w=cfg.tile_w)
         candidates = native_cuda.match_candidates(transcripts, batch.commitment.noise_seed_A, training_threshold)
         matches.extend((row, col + first_tile, digest) for row, col, digest in candidates)
@@ -89,7 +94,66 @@ def wr_seed_tail(local_seed: bytes, device_seed: bytes) -> bytes:
         raise ValueError(_BAD_SEED_SIZE)
     return bytes((byte % 129 - 64 & 255 for byte in StreamDigest(device_seed + local_seed).digest()[:16]))
 
-def prepare_training_batch(job: TrainingJob, config: TrainingConfig, rng: np.random.Generator, *, device='cpu', native=False):
+
+@dataclass(frozen=True)
+class _CapturedBatch:
+    config: CapturedTrainingConfig
+    a_noised: torch.Tensor
+    b_noised_t: torch.Tensor
+    commitment: object
+    local_seed: bytes
+    device_seed: bytes
+    header_bytes: bytes
+
+
+class CapturedBatchPreparation:
+    """Reuse the right operand while its header key is current on this device."""
+
+    def __init__(self, config: CapturedTrainingConfig, device):
+        self.config = config
+        self.device = torch.device(device)
+        self._right_operand = None
+
+    def clear(self):
+        self._right_operand = None
+
+    def prepare(self, job: TrainingJob, local_seed: bytes, tail: bytes):
+        from S5_base.commitment_hash import CommitmentHasher
+        from . import native_cuda
+        from .protocol_types import PartialHeader
+
+        cfg = self.config
+        device = self.device
+        base = signal_base()
+        right = self._right_operand
+        if right is None or right[0] != job.header_bytes:
+            self.clear()
+            right = None
+            header = PartialHeader.from_bytes(job.header_bytes)
+            key = CommitmentHasher.get_key(header.to_bytes(), cfg.official_config())
+            b_root = native_cuda.constant_tree_root(cfg.n * cfg.k, base, key, device)
+        else:
+            _, key, b_root, bt_noised = right
+
+        a = torch.full((cfg.m + 1, cfg.k), base, dtype=torch.int8, device=device)
+        a[-1, -16:] = torch.from_numpy(np.frombuffer(tail, dtype=np.int8).copy()).to(device)
+        a_root = native_cuda.tree_root(a, key)
+        commitment = CommitmentHasher.commitment_hash_from_tree_roots(
+            a_root, b_root, key, salted_dims=(cfg.m + 1, cfg.n))
+        if right is None:
+            # The right noise seed depends only on the right tree and header key.
+            bt_noised = native_cuda.constant_noised_operand(
+                cfg.n, cfg.k, base, commitment.noise_seed_B, device, right=True)
+            self._right_operand = (job.header_bytes, key, b_root, bt_noised)
+        # The seed tail changes the left commitment. Its row never enters a dot product.
+        a_noised = native_cuda.constant_noised_operand(
+            cfg.m, cfg.k, base, commitment.noise_seed_A, device)
+        return _CapturedBatch(cfg, a_noised, bt_noised, commitment, local_seed,
+                              job.device_seed, job.header_bytes)
+
+
+def prepare_training_batch(job: TrainingJob, config: TrainingConfig, rng: np.random.Generator, *, device='cpu', native=False,
+                           preparation: CapturedBatchPreparation | None = None):
     if not isinstance(job, TrainingJob) or job.cert_version != 3:
         raise ValueError(constant_text(FixedAlias('training.validation.batch_generation_three_required')))
     if job.device_seed is None:
@@ -97,6 +161,10 @@ def prepare_training_batch(job: TrainingJob, config: TrainingConfig, rng: np.ran
     local_seed = rng.bytes(8)
     tail = wr_seed_tail(local_seed, job.device_seed)
     destination = torch.device(device)
+    if preparation is not None:
+        if not native or preparation.config != config or preparation.device != destination:
+            raise ValueError('captured batch preparation must match the native configuration and device')
+        return preparation.prepare(job, local_seed, tail)
     a = torch.full((config.m + 1, config.k), signal_base(), dtype=torch.int8, device=destination)
     bt = torch.full((config.n, config.k), signal_base(), dtype=torch.int8, device=destination)
     a[-1, -16:] = torch.from_numpy(np.frombuffer(tail, dtype=np.int8).copy()).to(destination)

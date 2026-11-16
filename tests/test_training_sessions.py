@@ -70,7 +70,10 @@ class NativeSessionTests(unittest.TestCase):
                 with patch.object(session, '_start_auth_reader'), patch.object(session.transport, 'send') as send:
                     def receive(view):
                         buffers.append(view.obj)
-                        self.assertEqual(decode_frame(view.tobytes())['params'][0], identity)
+                        request = decode_frame(view.tobytes())
+                        self.assertEqual(request['id'], 0)
+                        self.assertEqual(request['params'][0], identity)
+                        self.assertEqual(request['params'][2], 'WildRig_0.52.3')
                         self.assertIsNone(session.dialect.training_identity)
 
                     send.side_effect = receive

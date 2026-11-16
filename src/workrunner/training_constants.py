@@ -31,6 +31,10 @@ _TEXT = {
 _RATE_UNITS = ('units/s', 'kunits/s', 'Munits/s', 'Gunits/s', 'Tunits/s', 'Punits/s', 'Eunits/s')
 LOGGER_NAME = __package__
 WR_CAPTURED_SHAPE = (4096, 262144, 8192, 8, 16)
+WR_CLIENT_AGENT = 'WildRig_0.52.3'
+WR_FIRST_REPORT_DELAY = 15.0
+WR_REPORT_INTERVAL = 120.6
+WR_SOCKET_TIMEOUT = 180.0
 __all__ = [*_TEXT, 'RATE_UNITS', 'LOGGER_NAME', 'local_seed_field',
            's6_noise_seed_prefix', 's7_legacy_alias', 'text_matches',
            'has_identity_mode_prefix']

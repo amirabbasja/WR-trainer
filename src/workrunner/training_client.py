@@ -28,6 +28,8 @@ class TrainingSession(S3Session):
         if login_config is not None:
             settings = {key: value for key, value in settings.items() if key not in ('WR_S2', 'KEX_uname')}
         super().__init__(settings, stop_event)
+        self._next_id = 0
+        self.transport.socket_timeout = max(self.transport.read_timeout, wire.WR_SOCKET_TIMEOUT)
         self._device_seed: bytes | None = None
         self._unknown_handler = unknown_handler
         self._recording_unknown = False

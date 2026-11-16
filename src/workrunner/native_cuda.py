@@ -27,6 +27,10 @@ class NativeUnavailable(RuntimeError):
 def _configure(lib):
     pointer, integer = (ctypes.c_void_p, ctypes.c_int)
     declarations = {'wr_transcripts_i8': [pointer, pointer, integer, integer, integer, pointer, pointer, integer], 'wr_match_candidates': [pointer, integer, pointer, pointer, pointer, pointer, pointer, integer, pointer], 'wr_noise_factors': [integer, integer, integer, pointer, pointer, pointer, pointer, pointer, pointer, pointer], 'wr_apply_noise': [pointer, pointer, integer, integer, integer, pointer, pointer, pointer, pointer, pointer, pointer, pointer], 'wr_tree_leaves': [pointer, ctypes.c_size_t, pointer, pointer, pointer], 'wr_tree_parents': [pointer, integer, pointer, pointer, integer, pointer]}
+    declarations.update({
+        'wr_tree_constant_leaves': [ctypes.c_size_t, ctypes.c_uint8, pointer, pointer, pointer],
+        'wr_noise_constant_operand': [integer, integer, integer, integer, pointer, pointer, pointer, pointer, pointer],
+    })
     for name, arguments in declarations.items():
         function = getattr(lib, name)
         function.argtypes, function.restype = (arguments, integer)
@@ -202,6 +206,14 @@ def _matrix(value, name):
     value.record_stream(torch.cuda.current_stream(value.device))
     return value
 
+def _reduce_tree(lib, layer, key_gpu, stream):
+    while layer.shape[0] > 1:
+        count = layer.shape[0]
+        parent = torch.empty(((count + 1) // 2, 8), dtype=torch.int32, device=layer.device)
+        _check(lib, lib.wr_tree_parents(layer.data_ptr(), count, key_gpu.data_ptr(), parent.data_ptr(), int(count == 2), stream))
+        layer = parent
+    return layer
+
 @torch.inference_mode()
 def tree_root(signal, key: bytes) -> bytes:
     signal = _matrix(signal, 'signal')
@@ -211,12 +223,35 @@ def tree_root(signal, key: bytes) -> bytes:
             leaves = (signal.numel() + 1023) // 1024
             layer = torch.empty((leaves, 8), dtype=torch.int32, device=signal.device)
             _check(lib, lib.wr_tree_leaves(signal.data_ptr(), signal.numel(), key_gpu.data_ptr(), layer.data_ptr(), stream))
-            while layer.shape[0] > 1:
-                count = layer.shape[0]
-                parent = torch.empty(((count + 1) // 2, 8), dtype=torch.int32, device=signal.device)
-                _check(lib, lib.wr_tree_parents(layer.data_ptr(), count, key_gpu.data_ptr(), parent.data_ptr(), int(count == 2), stream))
-                layer = parent
+            layer = _reduce_tree(lib, layer, key_gpu, stream)
         return layer.cpu().numpy().astype('<i4', copy=False).tobytes()
+
+@torch.inference_mode()
+def constant_tree_root(size, value, key, device):
+    if not 0 < size <= 2**32 or not 0 <= value <= 255:
+        raise ValueError('invalid constant matrix size or byte value')
+    with torch.cuda.device(device):
+        lib, stream = load_native(device), _stream(device)
+        with _temporary_words(device, key) as (key_gpu,):
+            leaves = torch.empty(((size + 1023) // 1024, 8), dtype=torch.int32, device=device)
+            _check(lib, lib.wr_tree_constant_leaves(size, value, key_gpu.data_ptr(), leaves.data_ptr(), stream))
+            root = _reduce_tree(lib, leaves, key_gpu, stream)
+        return root.cpu().numpy().astype('<i4', copy=False).tobytes()
+
+@torch.inference_mode()
+def constant_noised_operand(rows, k, value, key, device, *, right=False):
+    if min(rows, k) < 128 or rows * k >= 2**32 or not -128 <= value <= 127:
+        raise ValueError('invalid dimensions or value for a constant noised operand')
+    with torch.cuda.device(device):
+        lib, stream = load_native(device), _stream(device)
+        uniform = torch.empty((rows, 128), dtype=torch.int8, device=device)
+        indices = torch.empty((k, 2), dtype=torch.int32, device=device)
+        output = torch.empty((rows, k), dtype=torch.int8, device=device)
+        with _temporary_words(device, key) as (key_gpu,):
+            _check(lib, lib.wr_noise_constant_operand(
+                rows, k, value, int(right), key_gpu.data_ptr(), uniform.data_ptr(), indices.data_ptr(),
+                output.data_ptr(), stream))
+        return output
 
 @torch.inference_mode()
 def add_noise(a, bt, key_a: bytes, key_b: bytes):

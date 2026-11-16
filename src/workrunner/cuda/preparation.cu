@@ -8,6 +8,36 @@ __device__ __forceinline__ uint32_t uniform_word(uint32_t random) {
     const uint32_t masked = random & 0x3f3f3f3fu;
     return (masked & 0x1f1f1f1fu) | ((~masked & 0x20202020u) * 7u);
 }
+__device__ __forceinline__ void noise_factor(bool is_b, bool permutation,
+                                            uint32_t draw, uint32_t k,
+                                            const uint32_t* key, int8_t* uniform,
+                                            uint32_t* indices) {
+    uint32_t message[16] = {};
+    message[permutation ? 1 : 0] = draw + 1u;
+    message[8] = is_b ? 0x65745f42u : 0x65745f41u;
+    message[9] = 0x726f736eu;
+    uint32_t digest[8];
+    wr_digest_keyed64(message, key, digest);
+    if (!permutation) {
+        uint32_t* output = reinterpret_cast<uint32_t*>(uniform) + draw * 8u;
+        #pragma unroll
+        for (uint32_t word = 0; word < 8; ++word) {
+            output[word] = uniform_word(digest[word]);
+        }
+    } else {
+        uint2* output = reinterpret_cast<uint2*>(indices);
+        #pragma unroll
+        for (uint32_t word = 0; word < 8; ++word) {
+            const uint32_t column = draw * 8u + word;
+            if (column < k) {
+                const uint32_t value = digest[word];
+                const uint32_t first = value & (kRank - 1u);
+                const uint32_t second = first ^ (1u + __umulhi(kRank - 1u, value));
+                output[column] = make_uint2(first, second);
+            }
+        }
+    }
+}
 __global__ void noise_factors_kernel(
     uint32_t a_draws, uint32_t b_draws, uint32_t permutation_draws,
     uint32_t k, const uint32_t* key_a, const uint32_t* key_b,
@@ -36,31 +66,18 @@ __global__ void noise_factors_kernel(
         permutation = true;
         draw = job - uniform_draws - permutation_draws;
     }
-    uint32_t message[16] = {};
-    message[permutation ? 1 : 0] = draw + 1u;
-    message[8] = is_b ? 0x65745f42u : 0x65745f41u;
-    message[9] = 0x726f736eu;
-    uint32_t digest[8];
-    wr_digest_keyed64(message, is_b ? key_b : key_a, digest);
-    if (!permutation) {
-        uint32_t* output = reinterpret_cast<uint32_t*>(is_b ? brt : al) + draw * 8u;
-        #pragma unroll
-        for (uint32_t word = 0; word < 8; ++word) {
-            output[word] = uniform_word(digest[word]);
-        }
-    } else {
-        uint2* indices = reinterpret_cast<uint2*>(is_b ? b_indices : a_indices);
-        #pragma unroll
-        for (uint32_t word = 0; word < 8; ++word) {
-            const uint32_t column = draw * 8u + word;
-            if (column < k) {
-                const uint32_t value = digest[word];
-                const uint32_t first = value & (kRank - 1u);
-                const uint32_t second = first ^ (1u + __umulhi(kRank - 1u, value));
-                indices[column] = make_uint2(first, second);
-            }
-        }
-    }
+    noise_factor(is_b, permutation, draw, k, is_b ? key_b : key_a,
+                 is_b ? brt : al, is_b ? b_indices : a_indices);
+}
+__global__ void single_noise_factors_kernel(
+    uint32_t uniform_draws, uint32_t jobs, uint32_t k, bool is_b, const uint32_t* key,
+    int8_t* uniform, uint32_t* indices
+) {
+    const uint32_t job = blockIdx.x * blockDim.x + threadIdx.x;
+    if (job >= jobs) return;
+    const bool permutation = job >= uniform_draws;
+    noise_factor(is_b, permutation, permutation ? job - uniform_draws : job,
+                 k, key, uniform, indices);
 }
 __global__ void apply_noise_kernel(
     const int8_t* a, const int8_t* bt, uint32_t a_size, uint32_t total,
@@ -83,6 +100,20 @@ __global__ void apply_noise_kernel(
                         - static_cast<int>(uniform[indices[1]]);
         uint8_t* output = reinterpret_cast<uint8_t*>(is_b ? out_bt : out_a);
         output[offset] = static_cast<uint8_t>(value);
+    }
+}
+__global__ void apply_constant_noise_kernel(
+    uint32_t total, uint32_t k, int value, const int8_t* uniform,
+    const uint2* indices, uint8_t* output
+) {
+    const uint32_t stride = blockDim.x * gridDim.x;
+    for (uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += stride) {
+        const uint32_t offset = static_cast<uint32_t>(index);
+        const uint32_t row = offset / k;
+        const uint2 pair = indices[offset - row * k];
+        const int8_t* row_uniform = uniform + row * kRank;
+        output[offset] = static_cast<uint8_t>(value + row_uniform[pair.x] - row_uniform[pair.y]);
     }
 }
 }
@@ -127,5 +158,30 @@ extern "C" int wr_apply_noise(
         a, bt, static_cast<uint32_t>(a_size), static_cast<uint32_t>(total),
         static_cast<uint32_t>(k), al, brt, a_indices, b_indices, out_a, out_bt
     );
+    return static_cast<int>(cudaGetLastError());
+}
+extern "C" int wr_noise_constant_operand(
+    int rows, int k, int value, int is_b, const uint32_t* key, int8_t* uniform,
+    uint32_t* indices, uint8_t* output, void* stream
+) {
+    if (rows <= 0 || k <= 0 || !key || !uniform || !indices || !output)
+        return static_cast<int>(cudaErrorInvalidValue);
+    const uint64_t jobs = 4ull * rows + (static_cast<uint64_t>(k) + 7ull) / 8ull;
+    const uint64_t total = static_cast<uint64_t>(rows) * k;
+    if (jobs > INT_MAX || total > UINT32_MAX) return static_cast<int>(cudaErrorInvalidValue);
+    cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    constexpr uint32_t factor_threads = 128;
+    single_noise_factors_kernel<<<(jobs + factor_threads - 1) / factor_threads,
+                                 factor_threads, 0, cuda_stream>>>(
+        4u * rows, static_cast<uint32_t>(jobs), static_cast<uint32_t>(k), is_b != 0,
+        key, uniform, indices);
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return static_cast<int>(status);
+    constexpr uint32_t apply_threads = 256;
+    const uint64_t needed = (total + apply_threads - 1) / apply_threads;
+    const uint32_t blocks = static_cast<uint32_t>(needed < 65535 ? needed : 65535);
+    apply_constant_noise_kernel<<<blocks, apply_threads, 0, cuda_stream>>>(
+        static_cast<uint32_t>(total), static_cast<uint32_t>(k), value, uniform,
+        reinterpret_cast<const uint2*>(indices), output);
     return static_cast<int>(cudaGetLastError());
 }
