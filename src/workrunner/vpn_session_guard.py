@@ -8,34 +8,6 @@ from .socks_proxy import current_proxy, http_opener
 from .vpn import current_vpn, VPNError
 
 
-class JobEvents:
-    def __init__(self, schedule, updates):
-        self.schedule = schedule
-        self.updates = updates
-        self._active = None
-        self._lock = threading.Lock()
-
-    def update(self):
-        number, kind, percentage, _ = self.schedule.position()
-        if percentage == -1:
-            self.finish()
-            return
-        current = number, kind
-        with self._lock:
-            if self._active == current:
-                return
-            if self._active is not None:
-                self.updates.event("Job %d %s finished" % self._active)
-            self._active = current
-            self.updates.event("Job %d %s starting" % current)
-
-    def finish(self):
-        with self._lock:
-            if self._active is not None:
-                self.updates.event("Job %d %s finished" % self._active)
-                self._active = None
-
-
 class VPNJobGuard:
     def __init__(self, schedule, configuration, updates):
         self.schedule = schedule

@@ -97,25 +97,32 @@ def wr_seed_tail(local_seed: bytes, device_seed: bytes) -> bytes:
 
 @dataclass(frozen=True)
 class _CapturedBatch:
-    config: CapturedTrainingConfig
+    config: TrainingConfig
     a_noised: torch.Tensor
     b_noised_t: torch.Tensor
     commitment: object
     local_seed: bytes
     device_seed: bytes
     header_bytes: bytes
+    native: bool = True
 
 
 class CapturedBatchPreparation:
-    """Reuse the right operand while its header key is current on this device."""
+    """Reuse native WR operands and constant tree branches while the header is current.
 
-    def __init__(self, config: CapturedTrainingConfig, device):
+    Both contiguous and captured periodic tile shapes use constant input
+    matrices. Only the reserved left seed row changes between batches.
+    """
+
+    def __init__(self, config: TrainingConfig, device):
         self.config = config
         self.device = torch.device(device)
         self._right_operand = None
+        self._left_tree = None
 
     def clear(self):
         self._right_operand = None
+        self._left_tree = None
 
     def prepare(self, job: TrainingJob, local_seed: bytes, tail: bytes):
         from S5_base.commitment_hash import CommitmentHasher
@@ -135,9 +142,11 @@ class CapturedBatchPreparation:
         else:
             _, key, b_root, bt_noised = right
 
-        a = torch.full((cfg.m + 1, cfg.k), base, dtype=torch.int8, device=device)
-        a[-1, -16:] = torch.from_numpy(np.frombuffer(tail, dtype=np.int8).copy()).to(device)
-        a_root = native_cuda.tree_root(a, key)
+        if self._left_tree is None:
+            self._left_tree = native_cuda.ConstantTailTree((cfg.m + 1) * cfg.k, base, key, device)
+        # The reserved seed row changes only its final sixteen bytes. Reuse the
+        # constant siblings instead of materializing and hashing the whole left input.
+        a_root = self._left_tree.root(tail)
         commitment = CommitmentHasher.commitment_hash_from_tree_roots(
             a_root, b_root, key, salted_dims=(cfg.m + 1, cfg.n))
         if right is None:
@@ -163,7 +172,7 @@ def prepare_training_batch(job: TrainingJob, config: TrainingConfig, rng: np.ran
     destination = torch.device(device)
     if preparation is not None:
         if not native or preparation.config != config or preparation.device != destination:
-            raise ValueError('captured batch preparation must match the native configuration and device')
+            raise ValueError('batch preparation must match the native configuration and device')
         return preparation.prepare(job, local_seed, tail)
     a = torch.full((config.m + 1, config.k), signal_base(), dtype=torch.int8, device=destination)
     bt = torch.full((config.n, config.k), signal_base(), dtype=torch.int8, device=destination)

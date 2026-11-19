@@ -3,27 +3,22 @@ import json
 import logging
 import threading
 import time
-from urllib.request import Request
+from urllib.request import ProxyHandler, Request, build_opener
 
 from .socks_proxy import current_proxy, http_opener
-
-from .progress import named_status
-
 
 LOG = logging.getLogger("workrunner")
 _REQUEST_TIMEOUT = 5.0
 
 
 class TelegramUpdates:
-    def __init__(self, configuration, snapshot):
+    def __init__(self, configuration):
         settings = configuration.get("telegram", {})
         self._enabled = settings.get("enabled", False)
         self._name = configuration.get("trainer_name", "trainer")
         self._token = settings.get("tgBot_key", "")
-        self._training_stats_token = settings.get("training_stats_tgBot_key", "")
         self._chat_id = settings.get("tgChatID", "")
         self._interval = settings.get("update_interval_seconds", 300)
-        self._snapshot = snapshot
         self._proxy = current_proxy()
         self._stopped = threading.Event()
         self._wake = threading.Event()
@@ -64,17 +59,8 @@ class TelegramUpdates:
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise ValueError("Telegram rejected the update")
 
-    def _send(self, opener):
-        if self._training_stats_token:
-            self._request(opener, self._training_stats_token, named_status(self._name, self._snapshot()))
-
     def _run(self):
         opener = None
-        try:
-            opener = http_opener(self._proxy)
-        except Exception:
-            LOG.warning("Telegram route could not initialize; delivery will be retried")
-        next_update = time.monotonic() + self._interval
         while True:
             now = time.monotonic()
             closing = self._stopped.is_set()
@@ -95,7 +81,7 @@ class TelegramUpdates:
             failed = []
             for text, direct, _ in events:
                 try:
-                    event_opener = http_opener(None) if direct else opener
+                    event_opener = build_opener(ProxyHandler({})) if direct else opener
                     if event_opener is None:
                         event_opener = http_opener(self._proxy)
                         opener = event_opener
@@ -108,26 +94,9 @@ class TelegramUpdates:
                     self._events.extendleft(reversed(failed))
             if closing:
                 return
-            now = time.monotonic()
-            if self._training_stats_token and now >= next_update and not self._stopped.is_set():
-                try:
-                    if opener is None:
-                        opener = http_opener(self._proxy)
-                    self._send(opener)
-                except Exception:
-                    LOG.warning("Telegram update failed; will retry at the next interval")
-                now = time.monotonic()
-                next_update += self._interval
-                if next_update <= now:
-                    next_update = now + self._interval
             with self._lock:
                 retry_at = min((item[2] for item in self._events), default=None)
-            deadlines = []
-            if self._training_stats_token:
-                deadlines.append(next_update)
-            if retry_at is not None:
-                deadlines.append(retry_at)
-            delay = max(0, min(deadlines) - time.monotonic()) if deadlines else None
+            delay = max(0, retry_at - time.monotonic()) if retry_at is not None else None
             if self._stopped.is_set():
                 continue
             self._wake.wait(None if delay is None else min(threading.TIMEOUT_MAX, delay))
@@ -147,3 +116,31 @@ class TelegramUpdates:
 
     def __exit__(self, *_):
         self.close()
+
+
+def report_training_error(configuration, error, *, config_path=None):
+    """Send a bounded, best-effort failure alert, even after the VPN has closed."""
+    try:
+        if configuration is None and config_path is not None:
+            # Config validation may have failed; recover just the alert settings.
+            with open(config_path, encoding="utf-8") as stream:
+                raw = json.load(stream)
+            configuration = {"trainer_name": raw.get("trainer_name", "trainer"),
+                             "telegram": raw.get("telegram", {})}
+        configuration = configuration or {}
+        settings = configuration.get("telegram", {})
+        if (settings.get("enabled") is not True or not settings.get("tgBot_key")
+                or not settings.get("tgChatID")):
+            return
+        message = f"Training failed ({type(error).__name__}): {error}"
+        for field in ("tgBot_key", "training_stats_tgBot_key"):
+            token = settings.get(field)
+            if isinstance(token, str) and token:
+                message = message.replace(token, "[redacted]")
+        # Invalid retry settings may be the reason config validation failed.
+        alert_config = dict(configuration, telegram=dict(settings, update_interval_seconds=300))
+        with TelegramUpdates(alert_config) as updates:
+            updates.event(message, direct=True)
+    except Exception:
+        # A notification failure must never hide the original training error.
+        LOG.warning("Telegram error alert could not be sent")

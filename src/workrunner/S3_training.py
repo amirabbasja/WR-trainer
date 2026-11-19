@@ -17,7 +17,7 @@ from .progress import LiveProgress, in_notebook
 from .protocol import TrainingConfig, load_official_helpers, S3_training_threshold, prepare_batch, search_batch, verified_S3_submission
 from .gpu_utilization import GpuUtilization, busiest_gpu_sample
 from .telegram import TelegramUpdates
-from .vpn_session_guard import JobEvents, VPNJobGuard
+from .vpn_session_guard import VPNJobGuard
 from .progress import job_status
 from . import native_cuda
 from . import training_constants as wire
@@ -234,8 +234,9 @@ def _run_S3_training(configuration, *, login_only, login_config, stopped, effort
             pacer = GpuPacer(device, 100)
             pacer.set_monitor(monitor.read_sample)
             workers.append(TrainingDevice(device, name, native, pacer))
-        preparations = ({worker.device: CapturedBatchPreparation(cfg, worker.device) for worker in workers}
-                        if captured_shape else {})
+        preparations = ({worker.device: CapturedBatchPreparation(cfg, worker.device)
+                         for worker in workers if worker.native}
+                        if selected_protocol == 'WR' else {})
         side_pacer = None
         if workers:
             side_pacer = (GpuPacer(devices, 100) if len(devices) > 1 or effort.has_mixed_job
@@ -251,7 +252,7 @@ def _run_S3_training(configuration, *, login_only, login_config, stopped, effort
         side_job = (ScheduledSideJob(configuration, before_log=progress.clear, on_progress=show_side_job)
                     if not login_only else None)
 
-        def telegram_snapshot():
+        def progress_snapshot():
             now = time.monotonic()
             number, kind, percentage, boundary = effort.position(now)
             remaining = (0 if percentage == -1 else
@@ -270,23 +271,18 @@ def _run_S3_training(configuration, *, login_only, login_config, stopped, effort
                               remaining, speed, cnn_epoch=cnn_epoch)
 
         updates = None
-        events = None
         vpn_guard = None
         if not login_only:
-            updates = resources.enter_context(TelegramUpdates(configuration, telegram_snapshot))
-            events = JobEvents(effort, updates)
-            resources.callback(events.finish)
+            updates = resources.enter_context(TelegramUpdates(configuration))
             vpn_guard = resources.enter_context(VPNJobGuard(effort, configuration, updates))
 
         def update_progress(force=False):
             nonlocal active_job
             if monitors:
-                if events is not None:
-                    events.update()
                 kind = effort.current_job()[0]
                 force = force or active_job != kind
                 active_job = kind
-                progress.update(telegram_snapshot(), force=force)
+                progress.update(progress_snapshot(), force=force)
 
         def log(level, message, *args):
             LOG.debug(message, *args)
@@ -300,7 +296,7 @@ def _run_S3_training(configuration, *, login_only, login_config, stopped, effort
             log(logging.INFO, constant_text(FixedAlias('training.log.accelerator_metrics_sent')), format_training_rate(rate), request_id)
         update_progress(force=True)
         if not login_only:
-            progress.start_refresh(telegram_snapshot)
+            progress.start_refresh(progress_snapshot)
         if side_job is not None:
             resources.callback(side_job.close)
             if effort.has_mixed_job:

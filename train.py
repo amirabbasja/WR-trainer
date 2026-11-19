@@ -138,17 +138,22 @@ def run(root=None, *, login_only=False):
 
     root = Path(root or Path(__file__).parent).resolve()
     sys.path.insert(0, str(root / 'src'))
+    report_training_error = None
+    config = None
+    config_path = root / 'config.json'
     generate_artifacts = True
+    notebook = False
     previous_bytecode = sys.dont_write_bytecode
     try:
         sys.dont_write_bytecode = True
+        from workrunner.telegram import report_training_error
         from workrunner.paths import set_checkout_directories
         set_checkout_directories(root)
         from workrunner.config import resolve_S3_settings
         from workrunner.login_config import load_training_config
         from workrunner.progress import in_notebook
         from workrunner.training_artifacts import training_output
-        config_path = root / 'config.json'
+        notebook = in_notebook()
         config = load_training_config(config_path)
         generate_artifacts = config['training']['generate_artifacts']
         if not login_only and config['training']['job_sequence'][0]['max_gpu_utilization'] == -1:
@@ -172,8 +177,10 @@ def run(root=None, *, login_only=False):
         if generate_artifacts:
             print('Stopped', flush=True)
         return 130
-    except (ValueError, RuntimeError, ImportError, OSError) as error:
-        if generate_artifacts or in_notebook():
+    except Exception as error:
+        if report_training_error is not None:
+            report_training_error(config, error, config_path=config_path)
+        if generate_artifacts or notebook:
             print(f'Training failed ({type(error).__name__}): {error}', flush=True)
         return 1
     finally:

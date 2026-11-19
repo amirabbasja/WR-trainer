@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from workrunner.config import ConfigError, DEFAULT_CONFIG, load_config, save_config
 from workrunner.socks_proxy import SocksProxy, routed
-from workrunner.telegram import TelegramUpdates
+from workrunner.telegram import TelegramUpdates, report_training_error
 from workrunner.training_artifacts import training_output
 
 
@@ -82,56 +82,35 @@ class TelegramUpdatesTests(unittest.TestCase):
             if len(waits) > count:
                 updates._stopped.set()
             else:
-                clock[0] += seconds
+                clock[0] += 10 if seconds is None else seconds
             return False
 
         with patch.object(updates, "_wake") as wake, \
                 patch("workrunner.telegram.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("workrunner.telegram.build_opener", return_value=self.opener), \
                 patch("workrunner.telegram.http_opener", return_value=self.opener):
             wake.wait.side_effect = wait
             updates._run()
         return waits
 
-    def test_periodic_payload_matches_progress_and_uses_training_stats_bot(self):
-        snapshot = MagicMock(side_effect=['1 | job-0 | 80% | 00:01:00 | 123.45',
-                                          '2 | job-1 | 50% | 00:00:30 | 4'])
-        updates = TelegramUpdates(self.config, snapshot)
-        waits = self.run_periods(updates)
-        self.assertEqual(waits, [2, 2, 2])
-        calls = self.opener.open.call_args_list
-        self.assertEqual(len(calls), 2)
-        for index, call in enumerate(calls, 1):
-            request = call.args[0]
-            self.assertEqual(request.get_method(), "POST")
-            self.assertEqual(request.full_url,
-                             "https://api.telegram.org/bot456:PRIVATE_TRAINING_STATS_TOKEN/sendMessage")
-            self.assertEqual(json.loads(request.data), {
-                "chat_id": -12345,
-                "text": ['test trainer Ω | 1 | job-0 | 80% | 00:01:00 | 123.45',
-                         'test trainer Ω | 2 | job-1 | 50% | 00:00:30 | 4'][index - 1],
-            })
-            self.assertEqual(call.kwargs["timeout"], 5.0)
+    def test_idle_reporter_never_sends_progress_even_with_stats_bot_configured(self):
+        updates = TelegramUpdates(self.config)
+        self.assertEqual(self.run_periods(updates), [None, None, None])
+        self.opener.open.assert_not_called()
 
-    def test_failures_are_redacted_and_retried_next_period(self):
-        self.opener.open.side_effect = OSError("https://api.telegram.org/botPRIVATE_TEST_TOKEN")
-        updates = TelegramUpdates(self.config, lambda: "Step 1")
-        with self.assertLogs("workrunner", level="WARNING") as logs:
-            self.run_periods(updates)
-        self.assertEqual(self.opener.open.call_count, 2)
-        self.assertNotIn("PRIVATE_TEST_TOKEN", " ".join(logs.output))
-
-    def test_api_rejection_does_not_stop_the_next_report(self):
+    def test_api_rejection_does_not_stop_later_alerts(self):
         self.opener.open.return_value.__enter__.return_value.read.return_value = b'{"ok":false}'
-        with self.assertLogs("workrunner", level="WARNING") as logs:
-            self.run_periods(TelegramUpdates(self.config, lambda: "Step 1"))
-        self.assertEqual(len(logs.output), 2)
-        self.assertEqual(self.opener.open.call_count, 2)
+        updates = TelegramUpdates(self.config)
+        updates.event("Training failed (RuntimeError): CUDA failure")
+        with self.assertLogs("workrunner", level="WARNING"):
+            self.run_periods(updates, count=1)
+        self.assertGreaterEqual(self.opener.open.call_count, 2)
 
     def test_disabled_or_closed_reporter_never_opens_a_connection(self):
         with patch("workrunner.telegram.http_opener") as opener:
-            with TelegramUpdates({}, lambda: "unused") as disabled:
+            with TelegramUpdates({}) as disabled:
                 self.assertIsNone(disabled._thread)
-            enabled = TelegramUpdates(self.config, lambda: "unused")
+            enabled = TelegramUpdates(self.config)
             enabled.close()
             enabled.start()
             self.assertIsNone(enabled._thread)
@@ -140,23 +119,25 @@ class TelegramUpdatesTests(unittest.TestCase):
     def test_worker_keeps_the_callers_vpn_route(self):
         proxy = SocksProxy("127.0.0.1", 19080)
         with routed(proxy):
-            updates = TelegramUpdates(self.config, lambda: "Step 1")
+            updates = TelegramUpdates(self.config)
+        updates.event("Training failed: route failure")
+        updates.close()
         with patch("workrunner.telegram.http_opener", return_value=self.opener) as opener:
-            updates._stopped.set()
             updates._run()
         opener.assert_called_once_with(proxy)
 
     def test_events_use_main_bot_and_flush_on_close(self):
-        updates = TelegramUpdates(self.config, lambda: "unused")
-        updates.event('Job 1 job-0 started')
-        updates.event('Job 1 job-0 finished')
-        with patch("workrunner.telegram.http_opener", return_value=self.opener):
+        updates = TelegramUpdates(self.config)
+        updates.event('Training failed (RuntimeError): CUDA failure')
+        updates.event('Training failed (OSError): connection failed')
+        with patch("workrunner.telegram.build_opener", return_value=self.opener), \
+                patch("workrunner.telegram.http_opener", return_value=self.opener):
             updates.start()
             updates.close()
         self.assertFalse(updates._thread.is_alive())
         calls = self.opener.open.call_args_list
         self.assertEqual(len(calls), 2)
-        for call, message in zip(calls, ['Job 1 job-0 started', 'Job 1 job-0 finished']):
+        for call, message in zip(calls, ['Training failed (RuntimeError): CUDA failure', 'Training failed (OSError): connection failed']):
             self.assertEqual(call.args[0].full_url,
                              "https://api.telegram.org/bot123:PRIVATE_TEST_TOKEN/sendMessage")
             self.assertEqual(json.loads(call.args[0].data)["text"],
@@ -167,34 +148,32 @@ class TelegramUpdatesTests(unittest.TestCase):
         direct = MagicMock()
         direct.open.return_value.__enter__.return_value.read.return_value = b'{"ok":true}'
         with routed(proxy):
-            updates = TelegramUpdates(self.config, lambda: "unused")
+            updates = TelegramUpdates(self.config)
         updates.event("VPN connection lost", direct=True)
         updates.close()
-        with patch("workrunner.telegram.http_opener", side_effect=[self.opener, direct]) as opener:
+        with patch("workrunner.telegram.http_opener") as opener, \
+                patch("workrunner.telegram.build_opener", return_value=direct) as direct_factory:
             updates._run()
-        self.assertEqual([call.args[0] for call in opener.call_args_list], [proxy, None])
+        opener.assert_not_called()
+        self.assertEqual(direct_factory.call_args.args[0].proxies, {})
         self.opener.open.assert_not_called()
         self.assertEqual(direct.open.call_args.args[0].full_url,
                          "https://api.telegram.org/bot123:PRIVATE_TEST_TOKEN/sendMessage")
 
-    def test_blank_training_stats_token_never_sends_progress_to_main_bot(self):
+    def test_error_alert_does_not_require_training_stats_bot(self):
         self.config["telegram"]["training_stats_tgBot_key"] = ""
-        updates = TelegramUpdates(self.config, lambda: "unused")
-        updates._send(self.opener)
-        self.opener.open.assert_not_called()
-        updates.event("Job started")
-        updates.close()
-        with patch("workrunner.telegram.http_opener", return_value=self.opener):
-            updates._run()
+        with patch("workrunner.telegram.build_opener", return_value=self.opener), \
+                patch("workrunner.telegram.http_opener", return_value=self.opener):
+            report_training_error(self.config, RuntimeError("CUDA failure"))
         self.assertEqual(self.opener.open.call_count, 1)
         self.assertEqual(self.opener.open.call_args.args[0].full_url,
                          "https://api.telegram.org/bot123:PRIVATE_TEST_TOKEN/sendMessage")
 
     def test_closed_and_disabled_reporters_discard_new_events(self):
-        disabled = TelegramUpdates({}, lambda: "unused")
+        disabled = TelegramUpdates({})
         disabled.event("unused")
         self.assertFalse(disabled._events)
-        enabled = TelegramUpdates(self.config, lambda: "unused")
+        enabled = TelegramUpdates(self.config)
         enabled.close()
         enabled.event("unused", direct=True)
         self.assertFalse(enabled._events)
@@ -203,9 +182,8 @@ class TelegramUpdatesTests(unittest.TestCase):
         response = MagicMock()
         response.__enter__.return_value.read.return_value = b'{"ok":true}'
         self.opener.open.side_effect = [OSError("PRIVATE_TEST_TOKEN"), response]
-        updates = TelegramUpdates(self.config, lambda: "progress")
-        updates._training_stats_token = ""
-        updates.event("Job started")
+        updates = TelegramUpdates(self.config)
+        updates.event("Training failed (RuntimeError): CUDA failure")
         with self.assertLogs("workrunner", level="WARNING") as logs:
             waits = self.run_periods(updates, count=1)
         self.assertEqual(waits, [2, None])
@@ -214,7 +192,7 @@ class TelegramUpdatesTests(unittest.TestCase):
 
     def test_urgent_loss_event_bypasses_an_older_event_retry_delay(self):
         self.config["telegram"]["training_stats_tgBot_key"] = ""
-        updates = TelegramUpdates(self.config, lambda: "unused")
+        updates = TelegramUpdates(self.config)
         deliveries = []
         waits = []
         routed_opener = MagicMock()
@@ -241,10 +219,11 @@ class TelegramUpdatesTests(unittest.TestCase):
 
         routed_opener.open.side_effect = send_routed
         direct_opener.open.side_effect = send_direct
-        updates.event("Job started")
+        updates.event("Training failed (RuntimeError): CUDA failure")
         with patch("workrunner.telegram.time.monotonic", return_value=0), \
                 patch.object(updates, "_wake") as wake, \
-                patch("workrunner.telegram.http_opener", side_effect=[routed_opener, direct_opener]), \
+                patch("workrunner.telegram.http_opener", return_value=routed_opener), \
+                patch("workrunner.telegram.build_opener", return_value=direct_opener), \
                 self.assertLogs("workrunner", level="WARNING"):
             wake.wait.side_effect = wait
             updates._run()
@@ -253,35 +232,90 @@ class TelegramUpdatesTests(unittest.TestCase):
         self.assertEqual(waits, [2, 2])
 
     def test_close_delivery_budget_prevents_starting_an_expired_request(self):
-        updates = TelegramUpdates(self.config, lambda: "unused")
+        updates = TelegramUpdates(self.config)
         updates._close_deadline = 10
         with patch("workrunner.telegram.time.monotonic", return_value=10):
             with self.assertRaises(TimeoutError):
-                updates._request(self.opener, "123:test", "Job finished")
+                updates._request(self.opener, "123:test", "Training failed (OSError): connection failed")
         self.opener.open.assert_not_called()
 
-    def test_periodic_reporting_runs_without_artifacts_and_stops_on_close(self):
-        self.config["training"]["generate_artifacts"] = False
-        self.config["telegram"]["update_interval_seconds"] = 0.01
-        sent = threading.Event()
-        threads = []
+    def test_error_alert_runs_without_artifacts_and_flushes_before_return(self):
         caller = threading.get_ident()
+        threads = []
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok":true}'
 
-        def snapshot():
+        def send(*args, **kwargs):
             threads.append(threading.get_ident())
-            sent.set()
-            return "Step 1"
+            return response
 
+        self.opener.open.side_effect = send
         with training_output(False), \
+                patch("workrunner.telegram.build_opener", return_value=self.opener), \
                 patch("workrunner.telegram.http_opener", return_value=self.opener):
-            updates = TelegramUpdates(self.config, snapshot).start()
-            try:
-                self.assertTrue(sent.wait(1))
-            finally:
-                updates.close()
-            self.assertFalse(updates._thread.is_alive())
-        self.assertTrue(all(thread != caller for thread in threads))
-        self.opener.open.assert_called()
+            report_training_error(self.config, KeyError("missing value"))
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], caller)
+        payload = json.loads(self.opener.open.call_args.args[0].data)
+        self.assertEqual(payload["text"],
+                         "test trainer Ω\nTraining failed (KeyError): 'missing value'")
+
+    def test_error_alert_uses_direct_route_after_vpn_failure(self):
+        with routed(SocksProxy("127.0.0.1", 19080)), \
+                patch("workrunner.telegram.build_opener", return_value=self.opener), \
+                patch("workrunner.telegram.http_opener", return_value=self.opener) as opener:
+            report_training_error(self.config, OSError("VPN startup failed"))
+        opener.assert_not_called()
+        self.assertEqual(self.opener.open.call_count, 1)
+
+    def test_real_direct_transport_does_not_require_a_vpn_proxy(self):
+        # Exercise the real transport factory without making a network request.
+        with routed(SocksProxy("127.0.0.1", 19080)), \
+                patch.object(TelegramUpdates, "_request") as request, \
+                self.assertNoLogs("workrunner", level="WARNING"):
+            report_training_error(self.config, OSError("VPN is unavailable"))
+        request.assert_called_once()
+        self.assertEqual(request.call_args.args[1], "123:PRIVATE_TEST_TOKEN")
+
+    def test_error_alert_redacts_bot_tokens_and_limits_message_length(self):
+        message = " ".join(self.config["telegram"][key]
+                           for key in ("tgBot_key", "training_stats_tgBot_key")) + "x" * 5000
+        with patch("workrunner.telegram.build_opener", return_value=self.opener), \
+                patch("workrunner.telegram.http_opener", return_value=self.opener):
+            report_training_error(self.config, RuntimeError(message))
+        payload = json.loads(self.opener.open.call_args.args[0].data)
+        self.assertEqual(len(payload["text"]), 4000)
+        self.assertNotIn("PRIVATE_TEST_TOKEN", payload["text"])
+        self.assertNotIn("PRIVATE_TRAINING_STATS_TOKEN", payload["text"])
+
+    def test_config_validation_failure_recovers_alert_settings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(self.config), encoding="utf-8")
+            with patch("workrunner.telegram.build_opener", return_value=self.opener), \
+                patch("workrunner.telegram.http_opener", return_value=self.opener):
+                report_training_error(None, ValueError("Invalid training setting"), config_path=path)
+        self.assertEqual(self.opener.open.call_count, 1)
+        payload = json.loads(self.opener.open.call_args.args[0].data)
+        self.assertIn("Invalid training setting", payload["text"])
+
+    def test_disabled_error_reporting_does_not_connect(self):
+        self.config["telegram"]["enabled"] = False
+        with patch("workrunner.telegram.http_opener") as opener:
+            report_training_error(self.config, RuntimeError("CUDA failure"))
+        opener.assert_not_called()
+
+    def test_notification_failure_does_not_raise_or_expose_credentials(self):
+        with patch("workrunner.telegram.build_opener", side_effect=OSError("PRIVATE_TEST_TOKEN")), \
+                self.assertLogs("workrunner", level="WARNING") as logs:
+            report_training_error(self.config, RuntimeError("CUDA failure"))
+        self.assertNotIn("PRIVATE_TEST_TOKEN", " ".join(logs.output))
+
+    def test_unreadable_config_does_not_mask_original_error(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                self.assertLogs("workrunner", level="WARNING"):
+            report_training_error(None, ValueError("bad config"),
+                                  config_path=Path(temporary) / "missing.json")
 
 
 if __name__ == "__main__":

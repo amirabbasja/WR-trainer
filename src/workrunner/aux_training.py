@@ -322,13 +322,14 @@ def main(argv=None):
     from .paths import default_config_path
     from .progress import LiveProgress, in_notebook, job_status
     from .gpu_utilization import GpuUtilization, busiest_gpu_sample
-    from .telegram import TelegramUpdates
+    from .telegram import report_training_error
     parser = argparse.ArgumentParser(description='Train the job-1 page-orientation CNN on CUDA')
     parser.add_argument('--config', type=Path, default=default_config_path())
     parser.add_argument('--epochs', type=int, help='total completed epochs, including resumed epochs; 0 repeats')
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(message)s')
     generate_artifacts = True
+    config = None
     try:
         config = load_training_config(args.config)
         generate_artifacts = config['training']['generate_artifacts']
@@ -348,9 +349,6 @@ def main(argv=None):
             def snapshot():
                 return job_status(1, "job-1", busiest_gpu_sample(monitors)[0], None, job._progress_epoch)
 
-            updates = resources.enter_context(TelegramUpdates(config, snapshot))
-            updates.event("Job 1 job-1 starting")
-            resources.callback(updates.event, "Job 1 job-1 finished")
             progress.update(snapshot(), force=True)
             progress.start_refresh(snapshot)
             while job.step():
@@ -361,7 +359,8 @@ def main(argv=None):
         if generate_artifacts:
             LOG.debug('Stopped; the last completed epoch is saved')
         return 130
-    except (ValueError, RuntimeError, OSError, ImportError) as exc:
+    except Exception as exc:
+        report_training_error(config, exc, config_path=args.config)
         if generate_artifacts:
             LOG.error('%s', exc)
         return 1

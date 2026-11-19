@@ -8,48 +8,6 @@ from workrunner.socks_proxy import SocksProxy
 from workrunner.vpn import VPNError
 
 
-class JobEventsTests(unittest.TestCase):
-    def setUp(self):
-        self.now = 100.0
-        clock = patch.object(vpn_session_guard.time, "monotonic", side_effect=lambda: self.now)
-        clock.start()
-        self.addCleanup(clock.stop)
-        self.schedule = JobSequence([{"title": 'job-0', "time": 10, "max_gpu_utilization": 80}, {"title": 'job-1', "time": 20, "max_gpu_utilization": 70}, {"title": 'job-0', "time": 5, "max_gpu_utilization": 60}], started=100)
-        self.updates = Mock()
-        self.events = vpn_session_guard.JobEvents(self.schedule, self.updates)
-
-    def test_start_finish_and_role_changes_are_emitted_once(self):
-        self.events.update()
-        self.events.update()
-        self.now = 110
-        self.events.update()
-        self.events.update()
-        self.events.finish()
-        self.events.finish()
-        self.assertEqual([call.args[0] for call in self.updates.event.call_args_list], [
-            'Job 1 job-0 starting', 'Job 1 job-0 finished',
-            'Job 2 job-1 starting', 'Job 2 job-1 finished',
-        ])
-
-    def test_repeating_jobs_keep_cumulative_numbers(self):
-        self.events.update()
-        self.now = 135
-        self.events.update()
-        self.assertEqual(self.schedule.position(), (4, 'job-0', 80, 145))
-        self.assertEqual(self.updates.event.call_args.args, ('Job 4 job-0 starting',))
-
-    def test_exit_finishes_active_job_without_starting_another(self):
-        schedule = JobSequence([{"title": 'job-0', "time": 10, "max_gpu_utilization": 80}, {"title": 'job-0', "time": 0, "max_gpu_utilization": -1}], started=100)
-        events = vpn_session_guard.JobEvents(schedule, self.updates)
-        events.update()
-        self.now = 110
-        events.update()
-        events.finish()
-        self.assertEqual([call.args[0] for call in self.updates.event.call_args_list], [
-            'Job 1 job-0 starting', 'Job 1 job-0 finished',
-        ])
-
-
 class VPNJobGuardTests(unittest.TestCase):
     def setUp(self):
         self.now = 100.0

@@ -1,0 +1,105 @@
+{
+  "gpu": "NVIDIA GeForce GTX 1660 SUPER",
+  "cuda_toolkit": "13.2",
+  "driver": "615.71.09",
+  "rate_accounting": "m*n*k per complete batch / wall time",
+  "scope": "Offline synthetic native WR batches: includes preparation and candidate filtering; excludes compilation, warmup, pool traffic, stale work and CPU share verification. No clock or power settings changed. Previous path uses uncached preparation and unchanged legacy large 8x8 kernel variant 7.",
+  "tests": {
+    "Production": 22,
+    "WR-trainer": 216,
+    "result": "all passed with CUDA enabled"
+  },
+  "runs": {
+    "previous": {
+      "command": "python tools/benchmark_miner.py --iterations 100 --uncached --variant 7",
+      "configuration": {
+        "gpu": "NVIDIA GeForce GTX 1660 SUPER",
+        "shape": [
+          4096,
+          4096,
+          16384
+        ],
+        "tile": [
+          8,
+          8
+        ],
+        "variant": 7,
+        "cached": false,
+        "warmup": 3,
+        "iterations": 100,
+        "stages": false
+      },
+      "result": {
+        "median": {
+          "prepare_ms": 7.499343017116189,
+          "compute_ms": 50.65182701218873,
+          "total_ms": 58.17876700893976,
+          "TH/s": 4.724711808663562
+        },
+        "aggregate_TH/s": 4.724374647478401
+      }
+    },
+    "Production": {
+      "command": "python tools/benchmark_miner.py --iterations 100",
+      "configuration": {
+        "gpu": "NVIDIA GeForce GTX 1660 SUPER",
+        "shape": [
+          4096,
+          4096,
+          16384
+        ],
+        "tile": [
+          8,
+          8
+        ],
+        "variant": 0,
+        "cached": true,
+        "warmup": 3,
+        "iterations": 100,
+        "stages": false
+      },
+      "result": {
+        "median": {
+          "prepare_ms": 2.0443869871087372,
+          "compute_ms": 42.10650650202297,
+          "total_ms": 44.14827798609622,
+          "TH/s": 6.226243003874912
+        },
+        "aggregate_TH/s": 6.2301845061416445
+      }
+    },
+    "WR-trainer": {
+      "command": "python tools/benchmark_miner.py --iterations 100",
+      "configuration": {
+        "gpu": "NVIDIA GeForce GTX 1660 SUPER",
+        "shape": [
+          4096,
+          4096,
+          16384
+        ],
+        "tile": [
+          8,
+          8
+        ],
+        "variant": 0,
+        "cached": true,
+        "warmup": 3,
+        "iterations": 100,
+        "stages": false
+      },
+      "result": {
+        "median": {
+          "prepare_ms": 2.0411024743225425,
+          "compute_ms": 42.19227598514408,
+          "total_ms": 44.24986749654636,
+          "TH/s": 6.211948702349056
+        },
+        "aggregate_TH/s": 6.21606497365647
+      }
+    }
+  },
+  "cuda_source_sha256": {
+    "transcripts.cu": "db7abd9daa47ada696a49554945f1a612f40b1d3cd8c27140ef37a073cf04815",
+    "tree.cu": "e25a9b2a59a7df5446f1bf4a4e0e048082e2d3d7253d05132194a1377d2b8488"
+  }
+}

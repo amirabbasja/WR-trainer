@@ -1,0 +1,100 @@
+{
+  "gpu": "NVIDIA GeForce GTX 1660 SUPER",
+  "compute_capability": "7.5",
+  "cuda_toolkit": "13.2",
+  "driver": "615.71.09",
+  "power_limit_W": 80,
+  "matrix_shape": [
+    4096,
+    4096,
+    16384
+  ],
+  "tile": [
+    8,
+    8
+  ],
+  "measurement": "One m*n*k per completed synthetic batch divided by summed synchronized batch times. Includes changing-nonce preparation, transcripts and candidate filtering. Reuses the right operand for a single synthetic header. Excludes compilation, verification, warmup and pool traffic. Used the existing clock settings and 80 W power limit on this instance.",
+  "commands": [
+    "python tools/benchmark_miner.py --warmup 30 --iterations 250",
+    "python tools/benchmark_miner.py --optimized --warmup 30 --iterations 250",
+    "python tools/benchmark_miner.py --optimized --warmup 100 --iterations 3000"
+  ],
+  "paired_runs": {
+    "Production": {
+      "runtime": {
+        "backend": "runtime",
+        "warmup_batches": 30,
+        "timed_batches": 250,
+        "verified_transcript_words": 0,
+        "total_measured_batch_seconds": 11.19112,
+        "median_prepare_ms": 2.2292,
+        "median_compute_and_filter_ms": 42.49315,
+        "median_batch_ms": 44.721,
+        "aggregate_TH_s": 6.140535
+      },
+      "offline_packed": {
+        "backend": "offline-packed",
+        "warmup_batches": 30,
+        "timed_batches": 250,
+        "verified_transcript_words": 4194304,
+        "total_measured_batch_seconds": 9.04355,
+        "median_prepare_ms": 1.31861,
+        "median_compute_and_filter_ms": 34.88766,
+        "median_batch_ms": 36.21051,
+        "aggregate_TH_s": 7.598731
+      },
+      "speedup_percent": 23.747
+    },
+    "WR-trainer": {
+      "runtime": {
+        "backend": "runtime",
+        "warmup_batches": 30,
+        "timed_batches": 250,
+        "verified_transcript_words": 0,
+        "total_measured_batch_seconds": 11.1774,
+        "median_prepare_ms": 2.23824,
+        "median_compute_and_filter_ms": 42.45266,
+        "median_batch_ms": 44.69297,
+        "aggregate_TH_s": 6.148076
+      },
+      "offline_packed": {
+        "backend": "offline-packed",
+        "warmup_batches": 30,
+        "timed_batches": 250,
+        "verified_transcript_words": 4194304,
+        "total_measured_batch_seconds": 9.05812,
+        "median_prepare_ms": 1.29775,
+        "median_compute_and_filter_ms": 34.92103,
+        "median_batch_ms": 36.22607,
+        "aggregate_TH_s": 7.586506
+      },
+      "speedup_percent": 23.396
+    }
+  },
+  "longer_Production_run": {
+    "backend": "offline-packed",
+    "warmup_batches": 100,
+    "timed_batches": 3000,
+    "verified_transcript_words": 4194304,
+    "total_measured_batch_seconds": 108.84951,
+    "median_prepare_ms": 1.17705,
+    "median_compute_and_filter_ms": 35.0369,
+    "median_batch_ms": 36.28852,
+    "aggregate_TH_s": 7.575907
+  },
+  "verification": {
+    "before_each_optimized_run": "Exact equality with the runtime for all transcript words of a separate fixed nonce at the requested shape.",
+    "independent": "Both checkouts matched NumPy cumulative transcripts on a 128x256x2176 signed int8 case, CPU candidate digests at four thresholds, and six complete packed operands on a non-default CUDA stream.",
+    "existing_test_suites": {
+      "Production": 22,
+      "WR-trainer": 216,
+      "result": "passed"
+    }
+  },
+  "benchmark_source_sha256": {
+    "tools/benchmark_miner.py": "07b0280c92300b81fe284eee4b840a29aea760fa874612d74d2cfc93466c4876",
+    "tools/benchmark_packed.py": "d539fba1243cfe0cd7f7dd8642ebadfa3f35d5a9cf6f32c1ecc27afc79a14487",
+    "tools/cuda/benchmark_preparation.cu": "fcf685f003bb22a0c87175375bd099738dfe5a094c667f5a691444ada5c692e2",
+    "tools/cuda/benchmark_transcripts.cu": "105b5686b59448a2572c458386a63a10d66e466b1d67e3e848c1baf07e616ba7"
+  }
+}

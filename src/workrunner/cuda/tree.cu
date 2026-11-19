@@ -87,3 +87,77 @@ extern "C" int wr_tree_parents(const uint32_t* input, int count,
         reinterpret_cast<cudaStream_t>(stream)>>>(input, count, key, output, root);
     return int(cudaGetLastError());
 }
+
+__global__ void wr_tree_tail_root_kernel(
+    size_t bytes, uint32_t fill, const uint32_t* key, const uint32_t* tail,
+    const uint32_t* siblings, uint32_t* output
+) {
+    // A seed changes only the final leaf; all siblings remain header-constant.
+    const uint32_t leaves = uint32_t((bytes + 1023) / 1024);
+    const uint32_t leaf = leaves - 1;
+    uint32_t cv[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) cv[i] = key[i];
+    for (int block = 0; block < 16; ++block) {
+        uint32_t message[16];
+        #pragma unroll
+        for (int word = 0; word < 16; ++word) {
+            const size_t offset = size_t(leaf) * 1024 + block * 64 + word * 4;
+            uint32_t value = 0;
+            #pragma unroll
+            for (int byte = 0; byte < 4; ++byte) {
+                const size_t position = offset + byte;
+                uint32_t next = 0;
+                if (position >= bytes - 16 && position < bytes) {
+                    const unsigned index = unsigned(position - (bytes - 16));
+                    next = (tail[index / 4] >> (8 * (index % 4))) & 255u;
+                } else if (position < bytes) {
+                    next = fill & 255u;
+                }
+                value |= next << (8 * byte);
+            }
+            message[word] = value;
+        }
+        const uint32_t flags = 16 | (block == 0 ? 1 : 0) |
+                               (block == 15 ? 2 : 0) |
+                               (leaves == 1 && block == 15 ? 8 : 0);
+        uint32_t next[8];
+        wr_digest_compress(message, cv, uint64_t(leaf), 64, flags, next);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) cv[i] = next[i];
+    }
+    // The last node has a left sibling exactly when this level has even count.
+    // An unmatched last node is promoted verbatim, matching wr_tree_parents.
+    for (uint32_t count = leaves, level = 0; count > 1;
+         count = (count + 1) / 2, ++level) {
+        if ((count & 1u) == 0) {
+            uint32_t message[16], next[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                message[i] = siblings[level * 8 + i];
+                message[8 + i] = cv[i];
+            }
+            wr_digest_compress(message, key, 0, 64,
+                               16 | 4 | (count == 2 ? 8 : 0), next);
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) cv[i] = next[i];
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) output[i] = cv[i];
+}
+
+extern "C" int wr_tree_tail_root(
+    size_t bytes, uint8_t value, const uint32_t* key, const uint32_t* tail,
+    const uint32_t* siblings, uint32_t* output, void* stream
+) {
+    // Arbitrary partial leaves are supported if all sixteen tail bytes are in
+    // the last leaf. WR sizes are multiples of 128 and always satisfy this.
+    if (!key || !tail || !siblings || !output || bytes < 16 || bytes > (size_t(1) << 32) ||
+        (bytes % 1024 && bytes % 1024 < 16))
+        return int(cudaErrorInvalidValue);
+    const uint32_t fill = uint32_t(value) * 0x01010101u;
+    wr_tree_tail_root_kernel<<<1, 1, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+        bytes, fill, key, tail, siblings, output);
+    return int(cudaGetLastError());
+}

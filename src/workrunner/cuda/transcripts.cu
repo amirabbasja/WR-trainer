@@ -168,21 +168,25 @@ void launch_wide(const int* a, const int* bt, int m, int n, int k,
     transcripts_dp4a_wide<BM, BN, TW><<<grid, THREADS, 0, stream>>>(
         a, bt, m, n, k / 4, output);
 }
-template <int BM, int BN>
+template <int BM, int BN, int TW = 16, int ROW_LANES = 2, int COL_LANES = 2, int UNROLL = 2>
 __global__ void transcripts_dp4a_vector(const int* __restrict__ a,
                                         const int* __restrict__ bt,
                                         int m, int n, int k_words,
                                         uint32_t* __restrict__ output) {
     constexpr int TILE_H = 8;
-    constexpr int TILE_W = 16;
-    constexpr int ROW_LANES = 2;
-    constexpr int COL_LANES = 2;
+    constexpr int TILE_W = TW;
     constexpr int GROUP = ROW_LANES * COL_LANES;
     constexpr int THREADS = BM * BN * GROUP / (TILE_H * TILE_W);
     constexpr int ROWS = TILE_H / ROW_LANES;
     constexpr int COLS = TILE_W / COL_LANES;
     constexpr int WORDS = 16 / GROUP;
     constexpr int TILE_COLS = BN / TILE_W;
+    static_assert((TW == 8 || TW == 16) && 8 % ROW_LANES == 0 && TW % COL_LANES == 0,
+                  "each lane must own complete rows and columns of an 8x8 or 8x16 tile");
+    static_assert(GROUP <= 16 && (GROUP & (GROUP - 1)) == 0 && 16 % GROUP == 0,
+                  "the lane group must distribute exactly sixteen transcript words");
+    static_assert(BM % TILE_H == 0 && BN % TILE_W == 0,
+                  "block dimensions must contain complete output tiles");
     __shared__ int4 shared_a[BM][8];
     __shared__ int4 shared_b[BN][8];
     const int4* a_vectors = reinterpret_cast<const int4*>(a);
@@ -204,7 +208,7 @@ __global__ void transcripts_dp4a_vector(const int* __restrict__ a,
     const int a_swizzle = (tile_row * ROW_LANES + row_lane) & 7;
     const int b_swizzle = (tile_col * COL_LANES + col_lane) & 7;
 
-    // Four lanes cover one 8x16 tile. Keep each dot product across all rank-128 slabs.
+    // Lanes partition one output tile. Dot products accumulate across all rank-128 slabs.
     int cells[ROWS][COLS] = {};
     uint32_t transcript[WORDS] = {};
 
@@ -229,7 +233,7 @@ __global__ void transcripts_dp4a_vector(const int* __restrict__ a,
         }
         __syncthreads();
 
-        #pragma unroll 2
+        #pragma unroll UNROLL
         for (int inner = 0; inner < 8; ++inner) {
             int4 bv[COLS];
             #pragma unroll
@@ -280,12 +284,12 @@ __global__ void transcripts_dp4a_vector(const int* __restrict__ a,
     }
 }
 
-template <int BM, int BN>
+template <int BM, int BN, int TW = 16, int ROW_LANES = 2, int COL_LANES = 2, int UNROLL = 2>
 void launch_vector(const int* a, const int* bt, int m, int n, int k,
                    uint32_t* output, cudaStream_t stream) {
-    constexpr int THREADS = BM * BN / 32;
+    constexpr int THREADS = BM * BN * ROW_LANES * COL_LANES / (8 * TW);
     const dim3 grid((n + BN - 1) / BN, (m + BM - 1) / BM);
-    transcripts_dp4a_vector<BM, BN><<<grid, THREADS, 0, stream>>>(
+    transcripts_dp4a_vector<BM, BN, TW, ROW_LANES, COL_LANES, UNROLL><<<grid, THREADS, 0, stream>>>(
         a, bt, m, n, k / 4, output);
 }
 }
@@ -304,9 +308,14 @@ extern "C" int wr_transcripts_i8(const signed char* a, const signed char* bt,
         case 0:
             if (m <= 256 && n <= 256)
                 launch<64, 32>(packed_a, packed_bt, m, n, k, output, cuda_stream);
-            else if (m >= 768 && n >= 768)
-                launch_wide<128, 64>(packed_a, packed_bt, m, n, k, output, cuda_stream);
-            else
+            else if (m >= 768 && n >= 768) {
+                // Vector loads and two row lanes reuse each B vector across
+                // four rows while the larger block shares inputs across more tiles.
+                if (((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(bt)) & 15) == 0)
+                    launch_vector<128, 64, 8, 2, 1>(packed_a, packed_bt, m, n, k, output, cuda_stream);
+                else
+                    launch_wide<128, 64>(packed_a, packed_bt, m, n, k, output, cuda_stream);
+            } else
                 launch<64, 64>(packed_a, packed_bt, m, n, k, output, cuda_stream);
             break;
         case 4: launch<64, 64>(packed_a, packed_bt, m, n, k, output, cuda_stream); break;
@@ -317,9 +326,12 @@ extern "C" int wr_transcripts_i8(const signed char* a, const signed char* bt,
         case 6: launch<64, 128>(packed_a, packed_bt, m, n, k, output, cuda_stream); break;
         case 7: launch_wide<128, 64>(packed_a, packed_bt, m, n, k, output, cuda_stream); break;
         case 8:
-            if (((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(bt)) & 15) == 0)
-                launch_vector<64, 64>(packed_a, packed_bt, m, n, k, output, cuda_stream);
-            else
+            if (((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(bt)) & 15) == 0) {
+                if (m >= 768 && n >= 768)
+                    launch_vector<128, 64>(packed_a, packed_bt, m, n, k, output, cuda_stream);
+                else
+                    launch_vector<64, 64>(packed_a, packed_bt, m, n, k, output, cuda_stream);
+            } else
                 launch_wide<64, 64, 16>(packed_a, packed_bt, m, n, k, output, cuda_stream);
             break;
         default: return static_cast<int>(cudaErrorInvalidValue);

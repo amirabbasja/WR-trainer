@@ -1,11 +1,12 @@
 import ctypes
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 import hashlib
 import logging
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import threading
 import numpy as np
 import torch
@@ -29,6 +30,7 @@ def _configure(lib):
     declarations = {'wr_transcripts_i8': [pointer, pointer, integer, integer, integer, pointer, pointer, integer], 'wr_match_candidates': [pointer, integer, pointer, pointer, pointer, pointer, pointer, integer, pointer], 'wr_noise_factors': [integer, integer, integer, pointer, pointer, pointer, pointer, pointer, pointer, pointer], 'wr_apply_noise': [pointer, pointer, integer, integer, integer, pointer, pointer, pointer, pointer, pointer, pointer, pointer], 'wr_tree_leaves': [pointer, ctypes.c_size_t, pointer, pointer, pointer], 'wr_tree_parents': [pointer, integer, pointer, pointer, integer, pointer]}
     declarations.update({
         'wr_tree_constant_leaves': [ctypes.c_size_t, ctypes.c_uint8, pointer, pointer, pointer],
+        'wr_tree_tail_root': [ctypes.c_size_t, ctypes.c_uint8, pointer, pointer, pointer, pointer, pointer],
         'wr_noise_constant_operand': [integer, integer, integer, integer, pointer, pointer, pointer, pointer, pointer],
     })
     for name, arguments in declarations.items():
@@ -50,7 +52,7 @@ def load_native(device='cuda:0'):
     if capability < (6, 1):
         raise NativeUnavailable('native packed integer kernels require compute capability 6.1+')
     architecture = f'{capability[0]}{capability[1]}'
-    with _LOCK:
+    with _LOCK, ExitStack() as resources:
         if architecture in _LIBRARIES:
             return _LIBRARIES[architecture]
         compiler = shutil.which('nvcc')
@@ -65,37 +67,42 @@ def load_native(device='cuda:0'):
             fingerprint.update(path.read_bytes())
         cache = cache_dir() / 'native'
         library = cache / f'WR-sm{architecture}-{fingerprint.hexdigest()[:16]}.so'
-        if not library.is_file():
-            if not artifacts_enabled():
-                raise NativeUnavailable('native CUDA library is unavailable in the cache')
-            _build_library(library, compiler, architecture, paths)
+        persist_build = artifacts_enabled()
+        if not persist_build and not library.exists():
+            # Quiet runs still need native compute on a fresh checkout. Load the
+            # library before removing its temporary build directory; Linux keeps
+            # the loaded shared object mapped for the rest of this process.
+            cache = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix='wr-native-')))
+            library = cache / library.name
+        if persist_build:
+            cache.mkdir(parents=True, exist_ok=True)
+        build_lock = (cache / 'build.lock').open('w') if persist_build else nullcontext()
+        with build_lock as lock:
+            if lock is not None:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if not library.exists():
+                LOG.info('Building native CUDA kernels for sm_%s', architecture)
+                temporary = library.with_suffix(f'.{os.getpid()}.tmp.so')
+                command = [compiler, '-O3', '-std=c++17', '--shared', '-Xcompiler=-fPIC', f'-gencode=arch=compute_{architecture},code=sm_{architecture}', '-I', str(SOURCE), *[str(p) for p in paths if p.suffix == '.cu'], '-o', str(temporary)]
+                try:
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    temporary.unlink(missing_ok=True)
+                    raise NativeUnavailable(f'native CUDA build failed: {exc}') from exc
+                if persist_build:
+                    (cache / 'build.log').write_text(result.stdout + result.stderr)
+                if result.returncode:
+                    temporary.unlink(missing_ok=True)
+                    detail = (f"see {cache / 'build.log'}" if persist_build else
+                              (result.stderr or result.stdout).strip()[-4000:])
+                    raise NativeUnavailable(f'native CUDA build failed: {detail}')
+                temporary.replace(library)
         try:
             lib = _configure(ctypes.CDLL(str(library)))
         except (OSError, AttributeError) as exc:
             raise NativeUnavailable(f'cannot load native CUDA library: {exc}') from exc
         _LIBRARIES[architecture] = lib
         return lib
-
-def _build_library(library, compiler, architecture, paths):
-    cache = library.parent
-    cache.mkdir(parents=True, exist_ok=True)
-    with (cache / 'build.lock').open('w') as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        if library.is_file():
-            return
-        LOG.info('Building native CUDA kernels for sm_%s (cached after this build)', architecture)
-        temporary = library.with_suffix(f'.{os.getpid()}.tmp.so')
-        command = [compiler, '-O3', '-std=c++17', '--shared', '-Xcompiler=-fPIC', f'-gencode=arch=compute_{architecture},code=sm_{architecture}', '-I', str(SOURCE), *[str(p) for p in paths if p.suffix == '.cu'], '-o', str(temporary)]
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=180)
-            (cache / 'build.log').write_text(result.stdout + result.stderr)
-            if result.returncode:
-                raise NativeUnavailable(f"native CUDA build failed; see {cache / 'build.log'}")
-            temporary.replace(library)
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise NativeUnavailable(f'native CUDA build failed: {exc}') from exc
-        finally:
-            temporary.unlink(missing_ok=True)
 
 def available(device='cuda:0') -> bool:
     destination = str(device)
@@ -237,6 +244,56 @@ def constant_tree_root(size, value, key, device):
             _check(lib, lib.wr_tree_constant_leaves(size, value, key_gpu.data_ptr(), leaves.data_ptr(), stream))
             root = _reduce_tree(lib, leaves, key_gpu, stream)
         return root.cpu().numpy().astype('<i4', copy=False).tobytes()
+
+class ConstantTailTree:
+    """Cache tree siblings for a constant byte stream with a variable 16-byte tail."""
+
+    @torch.inference_mode()
+    def __init__(self, size, value, key, device):
+        if (type(size) is not int or not 16 <= size <= 2**32 or
+                (size % 1024 and size % 1024 < 16) or
+                type(value) is not int or not 0 <= value <= 255 or
+                not isinstance(key, bytes) or len(key) != 32):
+            raise ValueError('invalid constant seed-tail tree')
+        self.size, self.value, self.key = size, value, key
+        self.device = torch.device(device)
+        self.lib = load_native(self.device)
+        count = (size + 1023) // 1024
+        depth = (count - 1).bit_length()
+        with torch.cuda.device(self.device):
+            self.siblings = torch.empty((max(1, depth), 8), dtype=torch.int32, device=self.device)
+            stream = _stream(self.device)
+            with _temporary_words(self.device, key) as (key_gpu,):
+                layer = torch.empty((count, 8), dtype=torch.int32, device=self.device)
+                _check(self.lib, self.lib.wr_tree_constant_leaves(
+                    size, value, key_gpu.data_ptr(), layer.data_ptr(), stream))
+                level = 0
+                while count > 1:
+                    if count % 2 == 0:
+                        self.siblings[level].copy_(layer[count - 2])
+                    if count > 2:
+                        parent = torch.empty(((count + 1) // 2, 8), dtype=torch.int32, device=self.device)
+                        _check(self.lib, self.lib.wr_tree_parents(
+                            layer.data_ptr(), count, key_gpu.data_ptr(), parent.data_ptr(), 0, stream))
+                        layer = parent
+                    count = (count + 1) // 2
+                    level += 1
+
+    @torch.inference_mode()
+    def root(self, tail):
+        if not isinstance(tail, bytes) or len(tail) != 16:
+            raise ValueError('seed-tail tree requires exactly sixteen bytes')
+        with torch.cuda.device(self.device):
+            current = torch.cuda.current_stream(self.device)
+            self.siblings.record_stream(current)
+            output = torch.empty(8, dtype=torch.int32, device=self.device)
+            # _words stages exactly eight words; the kernel consumes the first four tail words.
+            with _temporary_words(self.device, self.key, tail + bytes(16)) as (key_gpu, tail_gpu):
+                _check(self.lib, self.lib.wr_tree_tail_root(
+                    self.size, self.value, key_gpu.data_ptr(), tail_gpu.data_ptr(),
+                    self.siblings.data_ptr(), output.data_ptr(), current.cuda_stream))
+            return output.cpu().numpy().astype('<i4', copy=False).tobytes()
+
 
 @torch.inference_mode()
 def constant_noised_operand(rows, k, value, key, device, *, right=False):
