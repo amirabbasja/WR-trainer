@@ -266,9 +266,12 @@ def _run_S3_training(configuration, *, login_only, login_config, stopped, effort
             else:
                 speed = (0 if percentage <= 0 or (vpn_guard is not None and vpn_guard.blocked())
                          else S3_training_rate(stats, cfg, now - started))
-            return job_status(number, kind,
+            status = job_status(number, kind,
                               max((value for monitor in monitors if (value := monitor.read()) is not None), default=None),
                               remaining, speed, cnn_epoch=cnn_epoch)
+            if vpn_guard is not None:
+                status += f" | VPN: {vpn_guard.status()}"
+            return status
 
         updates = None
         vpn_guard = None
